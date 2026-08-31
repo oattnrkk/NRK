@@ -1,0 +1,9 @@
+title: "Sync"
+
+tooltip: |
+  Download the latest version of this extension from GitHub and reload pyRevit.
+
+  Click this button whenever you want to update to the latest tools.
+
+author: "oattnrkk"
+description: "Sync this extension with the latest version on GitHub."
