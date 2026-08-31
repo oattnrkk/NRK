@@ -1,0 +1,7 @@
+title: 'Reverse Grid/Level'
+tooltip: >
+  สลับสถานะการแสดง bubble (หัวลูกศร) ทั้งสองฝั่งของ Grid/Level ที่เลือกไว้
+  ในมุมมองปัจจุบัน
+
+  เลือก Grid หรือ Level ก่อน แล้วกดปุ่มนี้
+author: 'nrk'

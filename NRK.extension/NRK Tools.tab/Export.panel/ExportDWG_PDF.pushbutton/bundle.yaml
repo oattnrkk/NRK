@@ -1,0 +1,6 @@
+title: 'Export DWG / PDF'
+tooltip: >
+  Export selected sheets to DWG and/or PDF with custom naming rules
+  (prefix/suffix/separator per parameter), Sheet Set auto-filter,
+  search, and hide-unchecked-sheets toggle.
+author: 'Oat'

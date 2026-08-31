@@ -1,0 +1,11 @@
+title: 'Sheet\nManager'
+tooltip: >
+  Sheet Manager & Title Block Parameter Filter Matcher
+
+  - Duplicate sheet ที่ติ๊กเลือก
+  - ลบคำว่า "-Copy" ในเลข/ชื่อ Sheet แบบ batch
+  - แก้ไขเลข/ชื่อ Sheet ในตารางแล้วบันทึกลง Revit ทีเดียว
+  - ดูด Title Block Properties จาก Sheet ต้นแบบไปพ่นใส่ Sheet อื่น (เลือกหมวดได้)
+  - เปลี่ยนประเภทกรอบ Title Block ทีละหลายแผ่น
+  - สร้าง Sheet ใหม่อย่างรวดเร็ว
+author: 'nrk'
