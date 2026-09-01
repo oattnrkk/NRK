@@ -37,6 +37,11 @@ FILE_OPERATION_RETRIES = 6
 FILE_OPERATION_RETRY_SECONDS = 0.75
 HTTP_USER_AGENT = "pyRevit-Sync/1.0"
 
+# Folders/files that are runtime artifacts, not part of the source-controlled
+# extension, so they must never be copied, compared, or pruned.
+EXCLUDE_DIR_NAMES = set([".git", "__pycache__", ".rocketmode"])
+EXCLUDE_FILE_SUFFIXES = (".pyc",)
+
 
 def find_extension_root(start_path):
     """Walk up from start_path until we hit a folder ending in .extension."""
@@ -70,8 +75,28 @@ def get_temp_path(file_name):
     return os.path.join(temp_dir, file_name)
 
 
-def download_zip(repo, branch, dest_zip_path):
-    url = "https://api.github.com/repos/{}/zipball/{}".format(repo, branch)
+def get_latest_commit_sha(repo, branch):
+    """Get the exact latest commit SHA on branch. Downloading the zipball
+    for a specific SHA (instead of a branch name) avoids GitHub's
+    branch-archive cache, which can serve a stale zip for a few minutes
+    after a push."""
+    url = "https://api.github.com/repos/{}/commits/{}".format(repo, branch)
+    request = urllib2.Request(url)
+    request.add_header("User-Agent", HTTP_USER_AGENT)
+    request.add_header("Accept", "application/vnd.github+json")
+    response = urllib2.urlopen(request, timeout=15)
+    try:
+        response_body = response.read()
+    finally:
+        response.close()
+    if isinstance(response_body, bytes):
+        response_body = response_body.decode("utf-8")
+    commit_data = json.loads(response_body)
+    return commit_data["sha"]
+
+
+def download_zip(repo, ref, dest_zip_path):
+    url = "https://api.github.com/repos/{}/zipball/{}".format(repo, ref)
     request = urllib2.Request(url)
     request.add_header("User-Agent", HTTP_USER_AGENT)
     request.add_header("Accept", "application/vnd.github+json")
@@ -149,13 +174,85 @@ def copy_file_with_retries(source_path, target_path, skipped_files):
     return False
 
 
+def collect_relative_files(root_dir):
+    """Return the set of relative file paths under root_dir, skipping
+    excluded runtime-artifact folders/files."""
+    collected = set()
+    for root_path, dir_names, file_names in os.walk(root_dir):
+        dir_names[:] = [
+            dir_name for dir_name in dir_names if dir_name not in EXCLUDE_DIR_NAMES
+        ]
+        relative_root = os.path.relpath(root_path, root_dir)
+        for file_name in file_names:
+            if file_name.endswith(EXCLUDE_FILE_SUFFIXES):
+                continue
+            relative_path = (
+                file_name
+                if relative_root == "."
+                else os.path.join(relative_root, file_name)
+            )
+            collected.add(relative_path)
+    return collected
+
+
+def delete_file_with_retries(target_path, failed_deletes):
+    last_error = None
+    for attempt in range(FILE_OPERATION_RETRIES):
+        try:
+            os.chmod(target_path, stat.S_IWRITE)
+            os.remove(target_path)
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt < FILE_OPERATION_RETRIES - 1:
+                time.sleep(FILE_OPERATION_RETRY_SECONDS * (attempt + 1))
+
+    failed_deletes.append((target_path, str(last_error) or "File is locked."))
+    return False
+
+
+def remove_empty_directories(root_dir):
+    """Walk bottom-up and remove any folder left empty after pruning."""
+    for root_path, dir_names, file_names in os.walk(root_dir, topdown=False):
+        if root_path == root_dir:
+            continue
+        if os.path.basename(root_path) in EXCLUDE_DIR_NAMES:
+            continue
+        try:
+            if not os.listdir(root_path):
+                os.rmdir(root_path)
+        except OSError:
+            pass
+
+
+def prune_removed_files(source_root, destination_root):
+    """Delete any local file that no longer exists in the downloaded
+    source, then clean up folders left empty by those deletions."""
+    source_files = collect_relative_files(source_root)
+    destination_files = collect_relative_files(destination_root)
+    extra_files = destination_files - source_files
+
+    deleted_count = 0
+    failed_deletes = []
+    for relative_path in extra_files:
+        target_path = os.path.join(destination_root, relative_path)
+        if delete_file_with_retries(target_path, failed_deletes):
+            deleted_count += 1
+
+    remove_empty_directories(destination_root)
+    return deleted_count, failed_deletes
+
+
 def copy_extension_contents(source_root, destination_root):
     """Copy every file from the downloaded folder over the local extension,
     skipping files that are locked instead of aborting the whole update."""
     copied_count = 0
     skipped_files = []
 
-    for root_path, _dir_names, file_names in os.walk(source_root):
+    for root_path, dir_names, file_names in os.walk(source_root):
+        dir_names[:] = [
+            dir_name for dir_name in dir_names if dir_name not in EXCLUDE_DIR_NAMES
+        ]
         relative_root = os.path.relpath(root_path, source_root)
         destination_path = (
             destination_root
@@ -173,6 +270,8 @@ def copy_extension_contents(source_root, destination_root):
                 continue
 
         for file_name in file_names:
+            if file_name.endswith(EXCLUDE_FILE_SUFFIXES):
+                continue
             source_path = os.path.join(root_path, file_name)
             target_path = os.path.join(destination_path, file_name)
             if copy_file_with_retries(source_path, target_path, skipped_files):
@@ -202,7 +301,8 @@ def sync_tools():
     temp_dir = get_temp_path("sync_extract_{}".format(update_token))
 
     try:
-        download_zip(repo, branch, temp_zip)
+        latest_sha = get_latest_commit_sha(repo, branch)
+        download_zip(repo, latest_sha, temp_zip)
         extract_zip(temp_zip, temp_dir)
         matched_folder = find_matching_folder(temp_dir, extension_folder)
 
@@ -213,16 +313,26 @@ def sync_tools():
         if copied_count == 0:
             raise RuntimeError("No files were copied. Nothing was updated.")
 
-        if skipped_files:
+        deleted_count, failed_deletes = prune_removed_files(
+            matched_folder, extension_root
+        )
+
+        if skipped_files or failed_deletes:
             forms.alert(
-                "Sync finished, but {} file(s) could not be replaced "
-                "because they were in use. Close Revit and run Sync again "
-                "to fully update.".format(len(skipped_files)),
+                "Sync finished, but {} file(s) could not be updated and "
+                "{} file(s) could not be removed because they were in use. "
+                "Close Revit and run Sync again to fully update.".format(
+                    len(skipped_files), len(failed_deletes)
+                ),
                 title="Sync",
                 warn_icon=True,
             )
         else:
-            print("Sync complete: {} file(s) updated.".format(copied_count))
+            print(
+                "Sync complete: {} file(s) updated, {} file(s) removed.".format(
+                    copied_count, deleted_count
+                )
+            )
 
         sessionmgr.reload_pyrevit()
 
