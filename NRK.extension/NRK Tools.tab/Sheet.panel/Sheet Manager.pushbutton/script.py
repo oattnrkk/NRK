@@ -6,7 +6,7 @@
 - ใช้ WPF UI เดิมทุกจุด (XAML เดิมไม่ได้แก้ไข)
 - แทนที่ RevitServices.Persistence/Transactions (ของ Dynamo) ด้วย pyrevit.revit
 """
-__title__ = "SheetManager"
+__title__ = "Sheet\nManager"
 __author__ = "nrk"
 __doc__ = "จัดการ Sheet: Duplicate / ลบคำว่า -Copy / บันทึกชื่อ-เลข / ดูด Title Block Properties / เปลี่ยนกรอบ / สร้าง Sheet ใหม่"
 

@@ -79,7 +79,9 @@ desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
 
 # ---------- helper: จำค่า config ล่าสุด (setup, output folder, naming rows, sheet set, formats) ----------
 CONFIG_DIR = os.path.join(os.environ.get('APPDATA', desktop_path), 'PyRevitExportDWGPDF')
-CONFIG_PATH = os.path.join(CONFIG_DIR, 'last_config.json')
+# ผูก config กับชื่อไฟล์โมเดล ไม่งั้นสลับโปรเจกต์แล้ว naming rule ของโปรเจกต์เก่าจะมาทับ
+_doc_key = sanitize(os.path.splitext(os.path.basename(doc.PathName))[0]) if doc.PathName else sanitize(doc.Title)
+CONFIG_PATH = os.path.join(CONFIG_DIR, 'last_config_{0}.json'.format(_doc_key or "untitled"))
 
 def load_last_config():
     try:
@@ -301,6 +303,7 @@ def on_item_check(sender, e):
             sheet_checked_state[displayed_indices[idx]] = new_val
     last_checked_display_index[0] = idx
     update_selected_count()
+    refresh_dgv_samples()
     # เลื่อนไป refresh หลังจาก event ปัจจุบันจบ และรวมหลายๆ ครั้งให้เหลือ 1 คิวเดียว กัน infinite loop / ค้าง
     if chk_hide_unchecked.Checked and not pending_hide_refresh[0]:
         pending_hide_refresh[0] = True
@@ -324,12 +327,14 @@ def check_all_clicked(sender, event):
     for i in range(len(all_sheets)):
         sheet_checked_state[i] = True
     rebuild_sheet_list(txt_search.Text)
+    refresh_dgv_samples()
 btn_check_all.Click += check_all_clicked
 
 def uncheck_all_clicked(sender, event):
     for i in range(len(all_sheets)):
         sheet_checked_state[i] = False
     rebuild_sheet_list(txt_search.Text)
+    refresh_dgv_samples()
 btn_uncheck_all.Click += uncheck_all_clicked
 
 # ---------- เลือก Sheet Set -> ติ๊กชีทที่อยู่ใน Sheet Set นั้นให้อัตโนมัติ ----------
@@ -341,6 +346,7 @@ def apply_sheet_set_selection(sender, event):
     for i in range(len(all_sheets)):
         sheet_checked_state[i] = (i in target_indices)
     rebuild_sheet_list(txt_search.Text)
+    refresh_dgv_samples()
 
 cb_sheetset.SelectedIndexChanged += apply_sheet_set_selection
 
@@ -365,10 +371,29 @@ dgv.Columns[3].Width = 100
 dgv.Columns[4].Name = "Separator"
 dgv.Columns[4].Width = 100
 
+def get_sample_sheet():
+    # ใช้ sheet แรกที่ถูกติ๊กเลือกเป็นตัวอย่าง preview ถ้ายังไม่ติ๊กอะไรเลยค่อย fallback ไป sheet แรกสุดในโมเดล
+    for i in range(len(all_sheets)):
+        if sheet_checked_state.get(i, False):
+            return all_sheets[i]
+    return all_sheets[0] if all_sheets else None
+
 def sample_value_for(name):
-    if all_sheets:
-        return get_param_value(all_sheets[0], name)
+    sheet_obj = get_sample_sheet()
+    if sheet_obj is not None:
+        return get_param_value(sheet_obj, name)
     return name
+
+def refresh_dgv_samples():
+    # เรียกทุกครั้งที่การติ๊กเลือก sheet เปลี่ยน เพื่อให้ Sample Value / Preview ตรงกับ sheet ที่จะ export จริง
+    try:
+        dgv
+    except NameError:
+        return
+    for i in range(dgv.Rows.Count):
+        name = dgv.Rows[i].Cells[0].Value
+        dgv.Rows[i].Cells[2].Value = sample_value_for(name)
+    update_preview(None, None)
 
 def build_filename(sheet_obj, rows):
     parts = []
@@ -380,7 +405,11 @@ def build_filename(sheet_obj, rows):
             parts.append(content + row["separator"])
         else:
             parts.append(content)
-    return "".join(parts)
+    result = "".join(parts).strip()
+    if not result:
+        # parameter ทุกตัวว่าง -> fallback เป็น Sheet Number กันไม่ให้ export ชื่อไฟล์ว่าง
+        result = sanitize(sheet_obj.SheetNumber) or "Sheet_{0}".format(sheet_obj.Id.IntegerValue)
+    return result
 
 def add_row(name, prefix="", suffix="", separator="_"):
     i = dgv.Rows.Add()
@@ -395,7 +424,7 @@ if last_config and last_config.get("rows"):
     for r in last_config["rows"]:
         add_row(r.get("name", ""), prefix=r.get("prefix", ""), suffix=r.get("suffix", ""), separator=r.get("separator", "_"))
 else:
-    add_row("Sheet Number", prefix="CHB2A-", separator="_")
+    add_row("Sheet Number", separator="_")
     add_row("Sheet Name", separator="")
 
 # 3b. แถบเพิ่ม/ลบ/ย้ายลำดับ parameter
@@ -449,7 +478,8 @@ def update_preview(sender, event):
         row_count = dgv.Rows.Count
         for i in range(row_count):
             prefix = dgv.Rows[i].Cells[1].Value or ""
-            sample = dgv.Rows[i].Cells[2].Value or ""
+            # sanitize sample เหมือนที่ build_filename() ทำจริงตอน export ไม่งั้น preview กับไฟล์จริงไม่ตรงกัน
+            sample = sanitize(dgv.Rows[i].Cells[2].Value or "")
             suffix = dgv.Rows[i].Cells[3].Value or ""
             sep = dgv.Rows[i].Cells[4].Value or ""
             content = "{0}{1}{2}".format(prefix, sample, suffix)
@@ -457,7 +487,10 @@ def update_preview(sender, event):
                 parts.append(content + sep)
             else:
                 parts.append(content)
-        lbl_preview.Text = "".join(parts)
+        preview_text = "".join(parts).strip()
+        if not preview_text:
+            preview_text = "(ว่างเปล่า - จะใช้ Sheet Number แทนอัตโนมัติตอน export)"
+        lbl_preview.Text = preview_text
     except:
         pass
 
@@ -466,6 +499,21 @@ dgv.CellEndEdit += update_preview
 update_preview(None, None)
 
 # 5. ฟังก์ชันปุ่มสั่งการ
+def check_folder_writable(folder):
+    if not os.path.isdir(folder):
+        try:
+            os.makedirs(folder)
+        except:
+            return False
+    test_path = os.path.join(folder, ".write_test_{0}".format(os.getpid()))
+    try:
+        with open(test_path, 'w') as f:
+            f.write("test")
+        os.remove(test_path)
+        return True
+    except:
+        return False
+
 def export_clicked(sender, event):
     sync_checked_state()
     checked_indices = [i for i in range(len(all_sheets)) if sheet_checked_state.get(i, False)]
@@ -481,6 +529,13 @@ def export_clicked(sender, event):
         return
     if dgv.Rows.Count == 0:
         MessageBox.Show("กรุณาเพิ่ม parameter อย่างน้อย 1 รายการครับ", "แจ้งเตือน")
+        return
+
+    output_folder = txt_folder.Text
+    if not check_folder_writable(output_folder):
+        MessageBox.Show(
+            "ไม่สามารถเขียนไฟล์ลงโฟลเดอร์นี้ได้ (สร้างไม่ได้ หรือไม่มีสิทธิ์เขียน):\n{0}".format(output_folder),
+            "แจ้งเตือน", MessageBoxButtons.OK, MessageBoxIcon.Error)
         return
 
     rows = []
@@ -516,7 +571,24 @@ def export_clicked(sender, event):
         if result != DialogResult.Yes:
             return
 
-    output_folder = txt_folder.Text
+    # --- เช็คไฟล์ชื่อเดียวกันที่มีอยู่แล้วในโฟลเดอร์ปลายทาง (เช่นจาก run ก่อนหน้า) ---
+    existing_files = []
+    for fname in filename_map.keys():
+        if export_dwg and os.path.exists(os.path.join(output_folder, fname + ".dwg")):
+            existing_files.append(fname + ".dwg")
+        if export_pdf and os.path.exists(os.path.join(output_folder, fname + ".pdf")):
+            existing_files.append(fname + ".pdf")
+    if existing_files:
+        msg_lines = ["พบไฟล์ชื่อเดียวกันอยู่แล้วในโฟลเดอร์ {0} ไฟล์ (จะถูกเขียนทับ):".format(len(existing_files)), ""]
+        msg_lines.extend(existing_files[:10])
+        if len(existing_files) > 10:
+            msg_lines.append("... และอีก {0} ไฟล์".format(len(existing_files) - 10))
+        msg_lines.append("")
+        msg_lines.append("ต้องการ export ทับหรือไม่?")
+        result = MessageBox.Show("\n".join(msg_lines), "ไฟล์ซ้ำกับที่มีอยู่", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+        if result != DialogResult.Yes:
+            return
+
     setup_name = cb_setup.SelectedItem
     sheet_set_name = str(cb_sheetset.SelectedItem) if cb_sheetset.SelectedItem else MANUAL_SELECTION_LABEL
 
@@ -559,45 +631,73 @@ def export_clicked(sender, event):
     progress_bar.Maximum = max(total_ops, 1)
     progress_bar.Value = 0
 
-    tx = Transaction(doc, "Dynamo Custom UI Export Complete")
-    tx.Start()
-
+    # หมายเหตุ: ไม่ใช้ Transaction ห่อ - doc.Export() ไม่แก้ไข model จึงไม่จำเป็นต้องมี
+    # (ของเดิมเปิด Transaction ทิ้งไว้ตลอด export ซึ่งไม่มีประโยชน์ และถ้า export
+    #  ล่ม/error กลางทางจะ commit ไม่ได้ ทำให้ปุ่ม/progress bar ค้าง)
     success_count = 0
     op_count = 0
-    for n, idx in enumerate(checked_indices):
-        sheet_obj = all_sheets[idx]
-        custom_filename = build_filename(sheet_obj, rows)
+    failed_sheets = []  # [(sheet_number, error_message), ...]
 
-        if export_dwg:
-            lbl_progress.Text = "Exporting DWG {0}/{1}: {2}".format(n + 1, total, custom_filename)
-            WinFormsApp.DoEvents()
-            view_ids = System.Collections.Generic.List[ElementId]()
-            view_ids.Add(sheet_obj.Id)
-            doc.Export(output_folder, custom_filename, view_ids, dwg_options)
-            op_count += 1
-            progress_bar.Value = op_count
-            WinFormsApp.DoEvents()
+    try:
+        for n, idx in enumerate(checked_indices):
+            sheet_obj = all_sheets[idx]
+            custom_filename = build_filename(sheet_obj, rows)
+            sheet_ok = True
 
-        if export_pdf:
-            lbl_progress.Text = "Exporting PDF {0}/{1}: {2}".format(n + 1, total, custom_filename)
-            WinFormsApp.DoEvents()
-            pdf_options.FileName = custom_filename
-            pdf_view_ids = System.Collections.Generic.List[ElementId]()
-            pdf_view_ids.Add(sheet_obj.Id)
-            doc.Export(output_folder, pdf_view_ids, pdf_options)
-            op_count += 1
-            progress_bar.Value = op_count
-            WinFormsApp.DoEvents()
+            if export_dwg:
+                try:
+                    lbl_progress.Text = "Exporting DWG {0}/{1}: {2}".format(n + 1, total, custom_filename)
+                    WinFormsApp.DoEvents()
+                    view_ids = System.Collections.Generic.List[ElementId]()
+                    view_ids.Add(sheet_obj.Id)
+                    doc.Export(output_folder, custom_filename, view_ids, dwg_options)
+                except Exception as ex:
+                    sheet_ok = False
+                    failed_sheets.append((sheet_obj.SheetNumber, "DWG: {0}".format(ex)))
+                op_count += 1
+                progress_bar.Value = op_count
+                WinFormsApp.DoEvents()
 
-        success_count += 1
+            if export_pdf:
+                try:
+                    lbl_progress.Text = "Exporting PDF {0}/{1}: {2}".format(n + 1, total, custom_filename)
+                    WinFormsApp.DoEvents()
+                    pdf_options.FileName = custom_filename
+                    pdf_view_ids = System.Collections.Generic.List[ElementId]()
+                    pdf_view_ids.Add(sheet_obj.Id)
+                    doc.Export(output_folder, pdf_view_ids, pdf_options)
+                except Exception as ex:
+                    sheet_ok = False
+                    failed_sheets.append((sheet_obj.SheetNumber, "PDF: {0}".format(ex)))
+                op_count += 1
+                progress_bar.Value = op_count
+                WinFormsApp.DoEvents()
 
-    tx.Commit()
+            if sheet_ok:
+                success_count += 1
+    finally:
+        # คืนสถานะปุ่ม/progress bar เสมอ ไม่ว่าจะสำเร็จ, fail บางส่วน, หรือพังกลางทาง
+        btn_export.Enabled = True
+        btn_cancel.Enabled = True
 
     lbl_progress.Text = "Done: {0}/{1} sheets exported".format(success_count, total)
     WinFormsApp.DoEvents()
 
     formats_label = ", ".join([f for f, enabled in [("DWG", export_dwg), ("PDF", export_pdf)] if enabled])
-    TaskDialog.Show("สำเร็จ", "Export {0} สำเร็จเรียบร้อยแล้วทั้งหมด {1} ชีท ลงที่ {2} ครับคุณชาย!".format(formats_label, success_count, output_folder))
+
+    if failed_sheets:
+        msg_lines = ["Export {0} เสร็จ {1}/{2} ชีท มี {3} ชีทที่ export ไม่สำเร็จ:".format(
+            formats_label, success_count, total, len(failed_sheets)), ""]
+        for sheet_num, err in failed_sheets[:10]:
+            msg_lines.append("- {0}: {1}".format(sheet_num, err))
+        if len(failed_sheets) > 10:
+            msg_lines.append("... และอีก {0} ชีท".format(len(failed_sheets) - 10))
+        msg_lines.append("")
+        msg_lines.append("ไฟล์ที่สำเร็จแล้วถูกบันทึกไว้ที่ {0} ครับ".format(output_folder))
+        TaskDialog.Show("เสร็จบางส่วน", "\n".join(msg_lines))
+    else:
+        TaskDialog.Show("สำเร็จ", "Export {0} สำเร็จเรียบร้อยแล้วทั้งหมด {1} ชีท ลงที่ {2} ครับคุณชาย!".format(
+            formats_label, success_count, output_folder))
     win.Close()
 
 btn_export = new_ctrl(Button, Text="Export", Location=Point(840, 535), Size=Size(100, 35), BackColor=Color.LightBlue)

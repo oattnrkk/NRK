@@ -128,9 +128,28 @@ if pick_point:
             dim_direction = view.RightDirection
         else:
             # หาเวกเตอร์ที่ตั้งฉากกับวัตถุ (Cross Product กับ View Direction)
-            dim_direction = direction_vector.CrossProduct(view.ViewDirection).Normalize()
+            cross = direction_vector.CrossProduct(view.ViewDirection)
+            # ถ้าทิศทางของวัตถุขนาน (หรือเกือบขนาน) กับ View Direction พอดี
+            # Cross Product จะเข้าใกล้ศูนย์ -> Normalize ได้ค่าที่ไม่มีความหมาย
+            # (ผ่าน .Normalize() ไปได้เพราะ Revit เช็ค zero-length ด้วย tolerance
+            # ที่ละเอียดกว่า ShortCurveTolerance มาก) ให้ fallback ไปใช้ RightDirection แทน
+            if cross.GetLength() < 1e-6:
+                dim_direction = view.RightDirection
+            else:
+                dim_direction = cross.Normalize()
 
         line_end_point = pick_point.Add(dim_direction.Multiply(0.5))
+
+        # กันไว้อีกชั้น เผื่อกรณีอื่นที่ทำให้จุดสองจุดใกล้กันเกินไป
+        # จะได้เห็นค่าจริงแทนที่จะเจอ Revit exception เฉยๆ
+        if pick_point.DistanceTo(line_end_point) < 0.01:
+            forms.alert(
+                "ไม่สามารถคำนวณทิศทางเส้น Dimension ได้ (จุดสองจุดใกล้กันเกินไป)\n\n"
+                "dim_direction: {}\npick_point: {}".format(dim_direction, pick_point),
+                title="Auto Dimension - Debug",
+                exitscript=True,
+            )
+
         line = Line.CreateBound(pick_point, line_end_point)
 
         doc.Create.NewDimension(view, line, ref_array)

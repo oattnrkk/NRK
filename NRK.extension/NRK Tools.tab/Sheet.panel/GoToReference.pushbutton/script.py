@@ -430,112 +430,38 @@ else:
         else:
             method_note = ""
 
-        def _auto_accept(sender, args):
-            # Auto-dismiss any TaskDialog Revit pops up during the view
-            # switch / zoom -- most commonly "There is no open view that
-            # shows any of the highlighted elements... Continue?" from
-            # ShowElements(). Always accept ("OK"/"Yes") so it never blocks
-            # or interrupts the user.
-            try:
-                args.OverrideResult(1)  # 1 = OK / Yes / continue
-            except Exception:
-                pass
-
-        def _zoom_to_marker():
-            """Best-effort zoom/select. Safe to call more than once."""
-            if marker_elem is None:
-                return
-            try:
-                uidoc.ShowElements(List[ElementId]([marker_elem.Id]))
-            except Exception:
-                pass
-            try:
-                uidoc.Selection.SetElementIds(List[ElementId]([marker_elem.Id]))
-            except Exception:
-                pass
-
-        # Keep the dialog-suppressor subscribed for the WHOLE switch+zoom
-        # sequence (including the deferred Idling attempt below), not just
-        # the doc.ActiveView call -- ShowElements() is what actually
-        # triggers Revit's "no open view shows this element, search closed
-        # views?" prompt, and that call happens after the view switch.
+        # --- Switch to the reference view ------------------------------
+        # Uses uidoc.RequestViewChange() ONLY. This is the official,
+        # well-tested Revit API method for switching the active view from
+        # an external command / button, and it is DEFERRED -- Revit applies
+        # the change safely on its own after this command returns control.
+        #
+        # An earlier version of this script instead set doc.ActiveView
+        # directly (twice, to "activate a viewport on a sheet") and then
+        # forced an immediate repaint with uidoc.RefreshActiveView() so it
+        # could zoom to the marker in the same click. That combination is
+        # NOT how Revit expects the active view to be changed from inside
+        # a running command, and it caused the whole Revit application to
+        # hang. It has been removed entirely -- reliability comes first;
+        # exact zoom-to-marker in the same click is not worth that risk.
         try:
-            uiapp.DialogBoxShowing += _auto_accept
-        except Exception:
-            pass
-
-        def _unsubscribe_dialog_suppressor():
-            try:
-                uiapp.DialogBoxShowing -= _auto_accept
-            except Exception:
-                pass
-
-        # --- Switch the active view -----------------------------------
-        # Try a SYNCHRONOUS switch (doc.ActiveView) first: this is the only
-        # way that lets ShowElements()/zoom-to take effect within the same
-        # command. uidoc.RequestViewChange is only a last-resort fallback,
-        # because it's DEFERRED (applied only after this command finishes).
-        switched = False
-        try:
-            if host_sheet is not None:
-                # doc.ActiveView must be set to the SHEET first, then to
-                # the view, so the second assignment activates that
-                # view's viewport on the now-open sheet (same as
-                # double-clicking it) instead of just opening it alone.
-                doc.ActiveView = host_sheet
-                doc.ActiveView = parent_view
-            else:
-                doc.ActiveView = parent_view
-            switched = True
-        except Exception:
-            switched = False
-
-        if not switched:
-            try:
-                uidoc.RequestViewChange(parent_view)
-                switched = True
-            except Exception as e:
-                message = "Found '{0}' but could not switch to it: {1}".format(
-                    parent_view.Name, str(e))
-
-        if switched:
+            uidoc.RequestViewChange(parent_view)
             result_view = parent_view
 
-            # Zoom attempt #1: right now. Works when Revit has already
-            # applied the view switch above (usually true for the
-            # doc.ActiveView / sheet-activation path).
-            _zoom_to_marker()
-
-            # Zoom attempt #2: queued on Idling, a ONE-SHOT handler that
-            # fires after this command finishes and Revit has fully
-            # redrawn the new active view. This is what actually fixes
-            # "switches view but doesn't zoom in" -- the UI doesn't finish
-            # updating until the command returns control to Revit, so a
-            # zoom/select call made too early can silently do nothing.
-            def _zoom_on_idle(sender, args):
+            if marker_elem is not None:
                 try:
-                    _zoom_to_marker()
-                finally:
-                    try:
-                        uiapp.Idling -= _zoom_on_idle
-                    except Exception:
-                        pass
-                    _unsubscribe_dialog_suppressor()
-
-            try:
-                uiapp.Idling += _zoom_on_idle
-            except Exception:
-                # Idling subscription failed -- nothing left waiting on the
-                # suppressor, safe to unsubscribe now.
-                _unsubscribe_dialog_suppressor()
+                    uidoc.Selection.SetElementIds(List[ElementId]([marker_elem.Id]))
+                except Exception:
+                    pass
 
             if host_sheet is not None:
-                message = "Opened sheet {0} and activated view '{1}'.{2}".format(
-                    sheet_label, parent_view.Name, method_note)
+                message = "Switched to '{0}' (placed on sheet {1}).{2}".format(
+                    parent_view.Name, sheet_label, method_note)
             else:
                 message = "Switched to '{0}'.{1}".format(parent_view.Name, method_note)
-        else:
-            _unsubscribe_dialog_suppressor()
+        except Exception as e:
+            message = "Found '{0}' but could not switch to it: {1}".format(
+                parent_view.Name, str(e))
 
 # --- Report result to the user -------------------------------------------
 # Silent on success (the view switch itself is the feedback). Only pop up
