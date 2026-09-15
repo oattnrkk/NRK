@@ -47,6 +47,8 @@ ProgressBar = WinForms.ProgressBar
 MessageBoxButtons = WinForms.MessageBoxButtons
 MessageBoxIcon = WinForms.MessageBoxIcon
 WinFormsApp = WinForms.Application
+AnchorStyles = WinForms.AnchorStyles
+ToolTip = WinForms.ToolTip
 
 Color = Drawing.Color
 Point = Drawing.Point
@@ -170,8 +172,8 @@ def new_ctrl(ctrl_type, **kwargs):
 # ---------- Form ----------
 win = new_ctrl(Form)
 win.Text = "Export DWG / PDF - Setup Naming Rules"
-win.Size = Size(1100, 660)
-win.MinimumSize = Size(1100, 660)
+win.Size = Size(1350, 660)
+win.MinimumSize = Size(1350, 660)
 win.StartPosition = FormStartPosition.CenterScreen
 win.BackColor = Color.FromArgb(240, 240, 240)
 win.Font = Font("Segoe UI", 9)
@@ -227,13 +229,28 @@ btn_uncheck_all = new_ctrl(Button, Text="Uncheck All", Location=Point(255, 88), 
 lbl_selected_count = new_ctrl(Label, Text="Selected: 0 / 0", Location=Point(340, 90), Size=Size(110, 23), ForeColor=Color.DimGray)
 chk_hide_unchecked = new_ctrl(CheckBox, Text="Hide un-checked sheets", Location=Point(460, 91), Size=Size(180, 23))
 
-txt_search = new_ctrl(TextBox, Location=Point(20, 115), Size=Size(345, 23))
-btn_search = new_ctrl(Button, Text="Search", Location=Point(370, 114), Size=Size(80, 25))
+txt_search = new_ctrl(TextBox, Location=Point(20, 115), Size=Size(590, 23))
+btn_search = new_ctrl(Button, Text="Search", Location=Point(620, 114), Size=Size(80, 25))
 
-chk_list_sheets = new_ctrl(CheckedListBox, Location=Point(20, 145), Size=Size(430, 380), CheckOnClick=True)
+chk_list_sheets = new_ctrl(CheckedListBox, Location=Point(20, 145), Size=Size(690, 380), CheckOnClick=True, HorizontalScrollbar=True,
+                            Anchor=AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom)
 
-lbl_progress = new_ctrl(Label, Text="", Location=Point(20, 530), Size=Size(430, 20), ForeColor=Color.DarkBlue, Visible=False)
-progress_bar = new_ctrl(ProgressBar, Location=Point(20, 552), Size=Size(430, 20), Minimum=0, Maximum=100, Value=0, Visible=False)
+sheet_tooltip = new_ctrl(ToolTip, AutoPopDelay=8000, InitialDelay=300, ReshowDelay=100)
+_last_tooltip_index = [-1]
+def sheet_list_mouse_move(sender, e):
+    idx = chk_list_sheets.IndexFromPoint(e.Location)
+    if idx != _last_tooltip_index[0]:
+        _last_tooltip_index[0] = idx
+        if idx >= 0 and idx < chk_list_sheets.Items.Count:
+            sheet_tooltip.SetToolTip(chk_list_sheets, str(chk_list_sheets.Items[idx]))
+        else:
+            sheet_tooltip.SetToolTip(chk_list_sheets, "")
+chk_list_sheets.MouseMove += sheet_list_mouse_move
+
+lbl_progress = new_ctrl(Label, Text="", Location=Point(20, 530), Size=Size(690, 20), ForeColor=Color.DarkBlue, Visible=False,
+                         Anchor=AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right)
+progress_bar = new_ctrl(ProgressBar, Location=Point(20, 552), Size=Size(690, 20), Minimum=0, Maximum=100, Value=0, Visible=False,
+                         Anchor=AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right)
 
 def sheet_label(s):
     return "{0} - {1}".format(s.SheetNumber, s.Name)
@@ -355,8 +372,8 @@ if str(cb_sheetset.SelectedItem) != MANUAL_SELECTION_LABEL:
     apply_sheet_set_selection(None, None)
 
 # 3. โซนจัดสเต็ปการตั้งชื่อ (ขวามือ)
-lbl_naming = new_ctrl(Label, Text="Name Parameters (In Order):", Location=Point(480, 90), Size=Size(250, 23))
-dgv = new_ctrl(DataGridView, Location=Point(480, 115), Size=Size(580, 220), AllowUserToAddRows=False, RowHeadersVisible=False)
+lbl_naming = new_ctrl(Label, Text="Name Parameters (In Order):", Location=Point(730, 90), Size=Size(250, 23), Anchor=AnchorStyles.Top | AnchorStyles.Right)
+dgv = new_ctrl(DataGridView, Location=Point(730, 115), Size=Size(580, 220), AllowUserToAddRows=False, RowHeadersVisible=False, Anchor=AnchorStyles.Top | AnchorStyles.Right)
 dgv.ColumnCount = 5
 dgv.Columns[0].Name = "Name"
 dgv.Columns[0].ReadOnly = True
@@ -428,8 +445,8 @@ else:
     add_row("Sheet Name", separator="")
 
 # 3b. แถบเพิ่ม/ลบ/ย้ายลำดับ parameter
-lbl_add = new_ctrl(Label, Text="Add Parameter:", Location=Point(480, 345), Size=Size(100, 23))
-cb_add_param = new_ctrl(ComboBox, Location=Point(480, 368), Size=Size(200, 23), DropDownStyle=ComboBoxStyle.DropDownList)
+lbl_add = new_ctrl(Label, Text="Add Parameter:", Location=Point(730, 345), Size=Size(100, 23), Anchor=AnchorStyles.Top | AnchorStyles.Right)
+cb_add_param = new_ctrl(ComboBox, Location=Point(730, 368), Size=Size(200, 23), DropDownStyle=ComboBoxStyle.DropDownList, Anchor=AnchorStyles.Top | AnchorStyles.Right)
 cb_add_param.Items.AddRange(System.Array[System.Object](param_names))
 if param_names:
     cb_add_param.SelectedIndex = 0
@@ -438,14 +455,14 @@ def add_param_clicked(sender, event):
     if cb_add_param.SelectedItem:
         add_row(str(cb_add_param.SelectedItem))
         update_preview(None, None)
-btn_add_param = new_ctrl(Button, Text="Add >>", Location=Point(690, 367), Size=Size(80, 25))
+btn_add_param = new_ctrl(Button, Text="Add >>", Location=Point(940, 367), Size=Size(80, 25), Anchor=AnchorStyles.Top | AnchorStyles.Right)
 btn_add_param.Click += add_param_clicked
 
 def remove_row_clicked(sender, event):
     if dgv.CurrentRow is not None and dgv.Rows.Count > 1:
         dgv.Rows.RemoveAt(dgv.CurrentRow.Index)
         update_preview(None, None)
-btn_remove_row = new_ctrl(Button, Text="Remove Row", Location=Point(780, 367), Size=Size(100, 25))
+btn_remove_row = new_ctrl(Button, Text="Remove Row", Location=Point(1030, 367), Size=Size(100, 25), Anchor=AnchorStyles.Top | AnchorStyles.Right)
 btn_remove_row.Click += remove_row_clicked
 
 def move_row(direction):
@@ -463,14 +480,14 @@ def move_row(direction):
     dgv.CurrentCell = dgv.Rows[j].Cells[0]
     update_preview(None, None)
 
-btn_up = new_ctrl(Button, Text="Move Up", Location=Point(480, 400), Size=Size(100, 25))
+btn_up = new_ctrl(Button, Text="Move Up", Location=Point(730, 400), Size=Size(100, 25), Anchor=AnchorStyles.Top | AnchorStyles.Right)
 btn_up.Click += lambda s, e: move_row(-1)
-btn_down = new_ctrl(Button, Text="Move Down", Location=Point(590, 400), Size=Size(100, 25))
+btn_down = new_ctrl(Button, Text="Move Down", Location=Point(840, 400), Size=Size(100, 25), Anchor=AnchorStyles.Top | AnchorStyles.Right)
 btn_down.Click += lambda s, e: move_row(1)
 
 # 4. ส่วน Preview หน้าตาชื่อไฟล์
-lbl_preview_title = new_ctrl(Label, Text="Preview of value:", Location=Point(480, 440), Size=Size(110, 23), Font=Font("Segoe UI", 9, FontStyle.Bold))
-lbl_preview = new_ctrl(Label, Text="", Location=Point(480, 465), Size=Size(580, 40), ForeColor=Color.DarkBlue)
+lbl_preview_title = new_ctrl(Label, Text="Preview of value:", Location=Point(730, 440), Size=Size(110, 23), Font=Font("Segoe UI", 9, FontStyle.Bold), Anchor=AnchorStyles.Top | AnchorStyles.Right)
+lbl_preview = new_ctrl(Label, Text="", Location=Point(730, 465), Size=Size(580, 40), ForeColor=Color.DarkBlue, Anchor=AnchorStyles.Top | AnchorStyles.Right)
 
 def update_preview(sender, event):
     try:
@@ -700,10 +717,10 @@ def export_clicked(sender, event):
             formats_label, success_count, output_folder))
     win.Close()
 
-btn_export = new_ctrl(Button, Text="Export", Location=Point(840, 535), Size=Size(100, 35), BackColor=Color.LightBlue)
+btn_export = new_ctrl(Button, Text="Export", Location=Point(1090, 535), Size=Size(100, 35), BackColor=Color.LightBlue, Anchor=AnchorStyles.Bottom | AnchorStyles.Right)
 btn_export.Click += export_clicked
 
-btn_cancel = new_ctrl(Button, Text="Cancel", Location=Point(960, 535), Size=Size(100, 35))
+btn_cancel = new_ctrl(Button, Text="Cancel", Location=Point(1210, 535), Size=Size(100, 35), Anchor=AnchorStyles.Bottom | AnchorStyles.Right)
 btn_cancel.Click += lambda s, e: win.Close()
 
 # ประกอบชิ้นส่วนลง Form หลัก
