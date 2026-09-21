@@ -367,10 +367,6 @@ def apply_sheet_set_selection(sender, event):
 
 cb_sheetset.SelectedIndexChanged += apply_sheet_set_selection
 
-# ถ้ามี config เก่าที่จำ sheet set ไว้ (ไม่ใช่ Manual) ให้ apply ทันทีตอนเปิดฟอร์ม
-if str(cb_sheetset.SelectedItem) != MANUAL_SELECTION_LABEL:
-    apply_sheet_set_selection(None, None)
-
 # 3. โซนจัดสเต็ปการตั้งชื่อ (ขวามือ)
 lbl_naming = new_ctrl(Label, Text="Name Parameters (In Order):", Location=Point(730, 90), Size=Size(250, 23), Anchor=AnchorStyles.Top | AnchorStyles.Right)
 dgv = new_ctrl(DataGridView, Location=Point(730, 115), Size=Size(580, 220), AllowUserToAddRows=False, RowHeadersVisible=False, Anchor=AnchorStyles.Top | AnchorStyles.Right)
@@ -514,6 +510,11 @@ def update_preview(sender, event):
 dgv.CellValueChanged += update_preview
 dgv.CellEndEdit += update_preview
 update_preview(None, None)
+
+# ถ้ามี config เก่าที่จำ sheet set ไว้ (ไม่ใช่ Manual) ให้ apply ทันทีตอนเปิดฟอร์ม
+# (ต้อง apply ตรงนี้ หลังสุด หลังจากที่ refresh_dgv_samples, dgv, และ update_preview ถูกสร้าง/ผูกครบแล้ว)
+if str(cb_sheetset.SelectedItem) != MANUAL_SELECTION_LABEL:
+    apply_sheet_set_selection(None, None)
 
 # 5. ฟังก์ชันปุ่มสั่งการ
 def check_folder_writable(folder):
