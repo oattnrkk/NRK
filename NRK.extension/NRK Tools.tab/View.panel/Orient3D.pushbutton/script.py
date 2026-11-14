@@ -14,7 +14,10 @@ uidoc = revit.uidoc
 
 # ชื่อ 3D view ที่ใช้ซ้ำทุกครั้ง = ชื่อ default 3D ของ Revit ตาม user ที่ login อยู่
 # (โปรเจกต์ Workshared: {3D - username} / ไม่ใช่ Workshared: {3D})
+# หมายเหตุ: ใช้สำหรับ "ค้นหา" เท่านั้น ห้ามเอาไปตั้งชื่อ view ผ่าน API เพราะมี { }
 VIEW_NAME = (u"{3D - " + doc.Application.Username + u"}") if doc.IsWorkshared else u"{3D}"
+# ชื่อสำรองตอนต้องสร้าง view ใหม่ ห้ามมี \ : { } [ ] | ; < > ? ` ~
+FALLBACK_NAME = u"3D - Orient"
 LOOK_DOWN = True    # True = มองจากด้านบนเหมือนแปลน, False = คงมุมกล้อง 3D เดิม
 PAD_FT = 0.0        # เผื่อขอบ Section Box (หน่วย ft)
 TRIM_PCT = 2.0      # ตัด element ที่อยู่ไกลสุดขอบออกด้านละ x% (เฉพาะกรณีไม่ได้เปิด Crop) 0 = ไม่ตัด
@@ -109,8 +112,19 @@ def get_z_range(view):
 
 
 def find_view3d():
-    for v in DB.FilteredElementCollector(doc).OfClass(DB.View3D):
-        if not v.IsTemplate and v.Name == VIEW_NAME:
+    cands = [v for v in DB.FilteredElementCollector(doc).OfClass(DB.View3D)
+             if not v.IsTemplate]
+    # 1) ชื่อตรงกับ user เป๊ะ
+    for v in cands:
+        if v.Name == VIEW_NAME:
+            return v
+    # 2) default 3D อันไหนก็ได้ ({3D}, {3D - xxx})
+    for v in cands:
+        if v.Name.startswith(u"{3D"):
+            return v
+    # 3) view สำรองที่เคยสร้างไว้
+    for v in cands:
+        if v.Name == FALLBACK_NAME:
             return v
     return None
 
@@ -124,7 +138,7 @@ def create_view3d():
     if vft is None:
         return None
     v3 = DB.View3D.CreateIsometric(doc, vft.Id)
-    v3.Name = VIEW_NAME
+    v3.Name = FALLBACK_NAME   # ห้ามใช้ VIEW_NAME ตรงนี้ เพราะมี { } แล้ว Revit จะ error
     return v3
 
 
