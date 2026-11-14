@@ -12,9 +12,13 @@ from pyrevit import revit, DB, forms
 doc = revit.doc
 uidoc = revit.uidoc
 
+<<<<<<< HEAD
 # ชื่อ 3D view ที่ใช้ซ้ำทุกครั้ง = ชื่อ default 3D ของ Revit ตาม user ที่ login อยู่
 # (โปรเจกต์ Workshared: {3D - username} / ไม่ใช่ Workshared: {3D})
 VIEW_NAME = (u"{3D - " + doc.Application.Username + u"}") if doc.IsWorkshared else u"{3D}"
+=======
+VIEW_NAME = u"{3D - narongkuV4UU9}"   # ชื่อ 3D view ที่ใช้ซ้ำทุกครั้ง
+>>>>>>> 53583716cd2a46f092fb7d6933eb5e8bc385742c
 LOOK_DOWN = True    # True = มองจากด้านบนเหมือนแปลน, False = คงมุมกล้อง 3D เดิม
 PAD_FT = 0.0        # เผื่อขอบ Section Box (หน่วย ft)
 TRIM_PCT = 2.0      # ตัด element ที่อยู่ไกลสุดขอบออกด้านละ x% (เฉพาะกรณีไม่ได้เปิด Crop) 0 = ไม่ตัด
