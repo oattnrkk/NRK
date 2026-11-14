@@ -17,7 +17,10 @@ uidoc = revit.uidoc
 # หมายเหตุ: ใช้สำหรับ "ค้นหา" เท่านั้น ห้ามเอาไปตั้งชื่อ view ผ่าน API เพราะมี { }
 VIEW_NAME = (u"{3D - " + doc.Application.Username + u"}") if doc.IsWorkshared else u"{3D}"
 # ชื่อสำรองตอนต้องสร้าง view ใหม่ ห้ามมี \ : { } [ ] | ; < > ? ` ~
-FALLBACK_NAME = u"3D - Orient"
+import re
+def _safe(s):
+    return re.sub(u"[\\\\:{}\\[\\]|;<>?`~]", u"", s).strip()
+FALLBACK_NAME = u"3D - " + _safe(doc.Application.Username or u"Orient")
 LOOK_DOWN = True    # True = มองจากด้านบนเหมือนแปลน, False = คงมุมกล้อง 3D เดิม
 PAD_FT = 0.0        # เผื่อขอบ Section Box (หน่วย ft)
 TRIM_PCT = 2.0      # ตัด element ที่อยู่ไกลสุดขอบออกด้านละ x% (เฉพาะกรณีไม่ได้เปิด Crop) 0 = ไม่ตัด
@@ -118,11 +121,7 @@ def find_view3d():
     for v in cands:
         if v.Name == VIEW_NAME:
             return v
-    # 2) default 3D อันไหนก็ได้ ({3D}, {3D - xxx})
-    for v in cands:
-        if v.Name.startswith(u"{3D"):
-            return v
-    # 3) view สำรองที่เคยสร้างไว้
+    # 2) view สำรองของ user นี้ที่เคยสร้างไว้ (ไม่แตะ view ของคนอื่น)
     for v in cands:
         if v.Name == FALLBACK_NAME:
             return v
