@@ -207,10 +207,8 @@ btn_browse.Click += browse_clicked
 lbl_sheetset = new_ctrl(Label, Text="Sheet Set:", Location=Point(20, 50), Size=Size(90, 23))
 cb_sheetset = new_ctrl(ComboBox, Location=Point(115, 47), Size=Size(230, 23), DropDownStyle=ComboBoxStyle.DropDownList)
 cb_sheetset.Items.AddRange(System.Array[System.Object](sheetset_options))
-restore_sheetset = MANUAL_SELECTION_LABEL
-if last_config and last_config.get("sheet_set") in sheetset_options:
-    restore_sheetset = last_config["sheet_set"]
-cb_sheetset.SelectedIndex = sheetset_options.index(restore_sheetset)
+# เริ่มที่ Manual Selection เสมอ (ไม่จำ Sheet Set จากครั้งก่อน กันติ๊กชีทผิดชุดโดยไม่ตั้งใจ)
+cb_sheetset.SelectedIndex = sheetset_options.index(MANUAL_SELECTION_LABEL)
 
 default_export_dwg = True
 default_export_pdf = True
@@ -511,12 +509,9 @@ dgv.CellValueChanged += update_preview
 dgv.CellEndEdit += update_preview
 update_preview(None, None)
 
-# ถ้ามี config เก่าที่จำ sheet set ไว้ (ไม่ใช่ Manual) ให้ apply ทันทีตอนเปิดฟอร์ม
-# (ต้อง apply ตรงนี้ หลังสุด หลังจากที่ refresh_dgv_samples, dgv, และ update_preview ถูกสร้าง/ผูกครบแล้ว)
-if str(cb_sheetset.SelectedItem) != MANUAL_SELECTION_LABEL:
-    apply_sheet_set_selection(None, None)
-
 # 5. ฟังก์ชันปุ่มสั่งการ
+final_message = [None]  # (title, text) ที่จะโชว์หลังฟอร์มปิดแล้ว
+
 def check_folder_writable(folder):
     if not os.path.isdir(folder):
         try:
@@ -608,13 +603,11 @@ def export_clicked(sender, event):
             return
 
     setup_name = cb_setup.SelectedItem
-    sheet_set_name = str(cb_sheetset.SelectedItem) if cb_sheetset.SelectedItem else MANUAL_SELECTION_LABEL
 
     save_last_config({
         "setup": setup_name,
         "output_folder": output_folder,
         "rows": rows,
-        "sheet_set": sheet_set_name,
         "export_dwg": export_dwg,
         "export_pdf": export_pdf
     })
@@ -712,10 +705,11 @@ def export_clicked(sender, event):
             msg_lines.append("... และอีก {0} ชีท".format(len(failed_sheets) - 10))
         msg_lines.append("")
         msg_lines.append("ไฟล์ที่สำเร็จแล้วถูกบันทึกไว้ที่ {0} ครับ".format(output_folder))
-        TaskDialog.Show("เสร็จบางส่วน", "\n".join(msg_lines))
+        final_message[0] = ("เสร็จบางส่วน", "\n".join(msg_lines))
     else:
-        TaskDialog.Show("สำเร็จ", "Export {0} สำเร็จเรียบร้อยแล้วทั้งหมด {1} ชีท ลงที่ {2} ครับคุณชาย!".format(
+        final_message[0] = ("สำเร็จ", "Export {0} สำเร็จเรียบร้อยแล้วทั้งหมด {1} ชีท ลงที่ {2} ครับคุณชาย!".format(
             formats_label, success_count, output_folder))
+    # ปิดฟอร์มก่อน แล้วค่อยโชว์ผลลัพธ์หลัง ShowDialog() จบ (ฟอร์มเป็น TopMost จะบัง TaskDialog ถ้าโชว์ตอนฟอร์มยังเปิดอยู่)
     win.Close()
 
 btn_export = new_ctrl(Button, Text="Export", Location=Point(1090, 535), Size=Size(100, 35), BackColor=Color.LightBlue, Anchor=AnchorStyles.Bottom | AnchorStyles.Right)
@@ -737,3 +731,7 @@ win.Controls.AddRange(System.Array[Control]([
 ]))
 
 win.ShowDialog()
+
+# โชว์ผลลัพธ์หลังฟอร์มปิด -> TaskDialog ผูกกับหน้าต่าง Revit จึงอยู่ด้านหน้าเสมอ
+if final_message[0]:
+    TaskDialog.Show(final_message[0][0], final_message[0][1])
