@@ -6,6 +6,7 @@ settings and runs every check in Revit: P0 / P1 / P2 / MONITORING.
 Put the XML in the same folder as this script, or browse to it."""
 __title__ = 'Model Health\nCheck'
 __author__ = 'NRK'
+__persistentengine__ = True
 
 import clr
 import os
@@ -16,17 +17,53 @@ import xml.etree.ElementTree as ET
 clr.AddReference('System.Windows.Forms')
 clr.AddReference('System.Drawing')
 clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
 
 import System
 from System.Collections.Generic import List, HashSet
 import System.Windows.Forms as WF
 import System.Drawing as SD
 import Autodesk.Revit.DB as DB
-from pyrevit import revit
+import Autodesk.Revit.UI as UI
+import System.Diagnostics
 
-doc = revit.doc
-uidoc = revit.uidoc
-app = doc.Application
+# These three are refreshed every time a queued job runs (see _Handler.Execute),
+# so the tool keeps working if the user switches to another model.
+uiapp = __revit__
+uidoc = uiapp.ActiveUIDocument
+doc = uidoc.Document if uidoc is not None else None
+app = uiapp.Application
+
+def _make_guard():
+    """pyRevit can wipe this script's global names once the script ends, but our
+    modeless window keeps calling functions afterwards (NameError). The guard keeps
+    a snapshot in closure cells (which survive) and puts back any missing names
+    before each window/event method runs."""
+    G = globals()
+    state = {'bk': None}
+
+    def guard(fn):
+        def wrapper(*a, **k):
+            bk = state['bk']
+            if bk is not None:
+                for target in (G, getattr(fn, 'func_globals', None)):
+                    if target is None:
+                        continue
+                    for key in bk:
+                        if key not in target:
+                            target[key] = bk[key]
+            return fn(*a, **k)
+        wrapper.__name__ = getattr(fn, '__name__', 'wrapper')
+        return wrapper
+
+    def snapshot():
+        state['bk'] = dict(G)
+
+    return guard, snapshot
+
+
+_guard, _snapshot = _make_guard()
+
 
 MAX_ROWS = 5000
 FT_TO_MM = 304.8
@@ -812,8 +849,473 @@ def run_check(ctx, chk):
 
 
 # ----------------------------------------------------------------------------
-# UI
+# Fixers (the "Fix" buttons)  -  each runs inside one Revit transaction
 # ----------------------------------------------------------------------------
+class Fixer(object):
+    def __init__(self, label, fn, confirm=None, ask=None, plan=None, tip=''):
+        self.label = label
+        self.fn = fn              # fn(ids, extra) -> summary text (runs in a transaction)
+        self.confirm = confirm    # text with {n}; None = apply without asking
+        self.ask = ask            # ask(ids) -> extra object, or None to cancel
+        self.plan = plan          # plan(ids, extra) -> list of preview lines
+        self.tip = tip
+
+
+def user_worksets():
+    return list(DB.FilteredWorksetCollector(doc).OfKind(DB.WorksetKind.UserWorkset))
+
+
+def ex_text(ex):
+    t = str(ex).strip().splitlines()
+    return t[0] if t else ex.__class__.__name__
+
+
+def short_desc(el):
+    try:
+        cat = el.Category.Name if el.Category is not None else ''
+    except Exception:
+        cat = ''
+    return '%s | %s (id %s)' % (cat, safe_name(el), eid_val(el.Id))
+
+
+def add_fail(failures, el, reason):
+    failures.append((el.Id, short_desc(el), reason))
+
+
+def blockers(ids, check_pinned=True, check_group=False):
+    """eid -> reason, for elements Revit will not let us change right now."""
+    out = {}
+    live = [i for i in ids if doc.GetElement(i) is not None]
+    if doc.IsWorkshared and len(live) <= 500:
+        try:
+            col = List[DB.ElementId]()
+            for i in live:
+                col.Add(i)
+            DB.WorksharingUtils.CheckoutElements(doc, col)      # takes ownership of whatever is free
+        except Exception:
+            pass
+        for i in live:
+            try:
+                st = DB.WorksharingUtils.GetCheckoutStatus(doc, i)
+                if st == DB.CheckoutStatus.OwnedByOtherUser:
+                    owner = DB.WorksharingUtils.GetWorksharingTooltipInfo(doc, i).Owner
+                    out[eid_val(i)] = 'Checked out by %s - ask them to relinquish it or sync, then try again' % owner
+                    continue
+                if DB.WorksharingUtils.GetModelUpdatesStatus(doc, i) == DB.ModelUpdatesStatus.UpdatedInCentral:
+                    out[eid_val(i)] = 'Changed in the central model - Synchronize / Reload Latest first'
+            except Exception:
+                pass
+    for i in live:
+        k = eid_val(i)
+        if k in out:
+            continue
+        el = doc.GetElement(i)
+        try:
+            if check_pinned and el.Pinned:
+                out[k] = 'Element is pinned - unpin it first'
+            elif check_group and is_valid_id(el.GroupId):
+                out[k] = 'Element is inside a group - edit the group instead'
+        except Exception:
+            pass
+    return out
+
+
+class FailLog(DB.IFailuresPreprocessor):
+    """Collects Revit's own failure messages so we can show them instead of a silent 'failed'."""
+    def __init__(self):
+        self.messages = []
+        self.has_error = False
+
+    def PreprocessFailures(self, accessor):
+        for m in accessor.GetFailureMessages():
+            try:
+                self.messages.append(m.GetDescriptionText())
+                if m.GetSeverity() == DB.FailureSeverity.Error:
+                    self.has_error = True
+            except Exception:
+                pass
+        if self.has_error:
+            return DB.FailureProcessingResult.ProceedWithRollBack
+        accessor.DeleteAllWarnings()
+        return DB.FailureProcessingResult.Continue
+
+
+def show_fix_report(title, summary, failures):
+    """failures: list of (ElementId or None, description, reason). Modal report with grouped reasons."""
+    groups = {}
+    for _, d, r in failures:
+        groups[r] = groups.get(r, 0) + 1
+    head = summary
+    if failures:
+        head += '\r\n\r\nWhy some could not be changed:'
+        for r, n in sorted(groups.items(), key=lambda kv: -kv[1])[:8]:
+            head += '\r\n   %d x  %s' % (n, r)
+    else:
+        head += '\r\n\r\n(Ctrl+Z in Revit will undo this.)'
+    if not failures:
+        WF.MessageBox.Show(head, title)
+        return
+    f = WF.Form()
+    f.Text = title
+    f.Width = 900
+    f.Height = 560
+    f.StartPosition = WF.FormStartPosition.CenterParent
+    box = WF.TextBox()
+    box.Multiline = True
+    box.ReadOnly = True
+    box.Dock = WF.DockStyle.Top
+    box.Height = 150
+    box.ScrollBars = WF.ScrollBars.Vertical
+    box.Text = head
+    lv = WF.ListView()
+    lv.Dock = WF.DockStyle.Fill
+    lv.View = WF.View.Details
+    lv.FullRowSelect = True
+    lv.GridLines = True
+    lv.Columns.Add('Element', 380)
+    lv.Columns.Add('Reason', 460)
+    for _, d, r in failures:
+        it = WF.ListViewItem(d)
+        it.SubItems.Add(r)
+        lv.Items.Add(it)
+    bar = WF.Panel()
+    bar.Dock = WF.DockStyle.Bottom
+    bar.Height = 40
+    text_all = head + '\r\n\r\n' + '\r\n'.join('%s\t%s' % (d, r) for _, d, r in failures)
+
+    def copy(s_, e_):
+        try:
+            WF.Clipboard.SetText(text_all)
+        except Exception:
+            pass
+    b1 = WF.Button()
+    b1.Text = 'Copy report'
+    b1.Left = 8
+    b1.Top = 7
+    b1.Width = 100
+    b1.Click += copy
+    bar.Controls.Add(b1)
+    b2 = WF.Button()
+    b2.Text = 'Close'
+    b2.Left = 116
+    b2.Top = 7
+    b2.DialogResult = WF.DialogResult.OK
+    bar.Controls.Add(b2)
+    f.Controls.Add(lv)
+    f.Controls.Add(box)
+    f.Controls.Add(bar)
+    f.AcceptButton = b2
+    f.ShowDialog()
+
+
+def delete_ids(ids):
+    """Delete elements. Returns (deleted_count, failures); a single failure does not stop the rest."""
+    failures = []
+    live = [i for i in ids if doc.GetElement(i) is not None]
+    blocked = blockers(live, check_pinned=True)
+    todo = []
+    for i in live:
+        r = blocked.get(eid_val(i))
+        if r:
+            add_fail(failures, doc.GetElement(i), r)
+        else:
+            todo.append(i)
+    if not todo:
+        return 0, failures
+    col = List[DB.ElementId]()
+    for i in todo:
+        col.Add(i)
+    try:
+        return len(doc.Delete(col)), failures
+    except Exception:
+        done = 0
+        for i in todo:
+            el = doc.GetElement(i)
+            if el is None:                       # already removed together with another element
+                continue
+            st = DB.SubTransaction(doc)
+            st.Start()
+            try:
+                doc.Delete(i)
+                st.Commit()
+                done += 1
+            except Exception as ex:
+                st.RollBack()
+                add_fail(failures, el, 'Revit refused to delete it: ' + ex_text(ex))
+        return done, failures
+
+
+def fx_delete(ids, extra):
+    done, failures = delete_ids(ids)
+    return '%d element(s) deleted, %d skipped' % (done, len(failures)), failures
+
+
+def fx_pin(ids, extra):
+    failures = []
+    done = 0
+    blocked = blockers(ids, check_pinned=False)
+    for i in ids:
+        el = doc.GetElement(i)
+        if el is None:
+            continue
+        r = blocked.get(eid_val(i))
+        if r:
+            add_fail(failures, el, r)
+            continue
+        try:
+            el.Pinned = True
+            done += 1
+        except Exception as ex:
+            add_fail(failures, el, ex_text(ex))
+    return '%d link(s) pinned, %d skipped' % (done, len(failures)), failures
+
+
+def fx_overlay(ids, extra):
+    failures = []
+    done = 0
+    for i in ids:
+        lt = doc.GetElement(i)
+        if lt is None:
+            continue
+        try:
+            if getattr(lt, 'IsNestedLink', False):
+                add_fail(failures, lt, 'Nested link (linked inside another link) - change it in the parent link\'s own model')
+                continue
+            lt.AttachmentType = DB.AttachmentType.Overlay
+            done += 1
+        except Exception as ex:
+            add_fail(failures, lt, ex_text(ex))
+    return '%d link type(s) set to Overlay, %d skipped' % (done, len(failures)), failures
+
+
+def set_workset(el, ws):
+    """Returns None when it worked, otherwise the reason."""
+    p = el.get_Parameter(DB.BuiltInParameter.ELEM_PARTITION_PARAM)
+    if p is None:
+        return 'Element has no workset parameter'
+    if p.IsReadOnly:
+        return 'Workset is read-only for this element (it may be inside a group or part of another element)'
+    try:
+        if p.Set(ws.Id.IntegerValue):
+            return None
+        return 'Revit refused the workset change'
+    except Exception as ex:
+        return ex_text(ex)
+
+
+def choose_workset(prompt, exclude):
+    """Small modal picker. exclude(name) -> True hides a workset."""
+    if not doc.IsWorkshared:
+        WF.MessageBox.Show('This model is not workshared.', 'Model Health Check')
+        return None
+    cands = [w for w in user_worksets() if not (exclude and exclude(w.Name))]
+    if not cands:
+        WF.MessageBox.Show('No suitable workset found. Create one first (Collaborate > Worksets).',
+                           'Model Health Check')
+        return None
+    f = WF.Form()
+    f.Text = 'Choose workset'
+    f.Width = 420
+    f.Height = 170
+    f.StartPosition = WF.FormStartPosition.CenterParent
+    f.FormBorderStyle = WF.FormBorderStyle.FixedDialog
+    f.MaximizeBox = False
+    f.MinimizeBox = False
+    lbl = WF.Label()
+    lbl.Text = prompt
+    lbl.Left = 12
+    lbl.Top = 12
+    lbl.Width = 380
+    f.Controls.Add(lbl)
+    cb = WF.ComboBox()
+    cb.DropDownStyle = WF.ComboBoxStyle.DropDownList
+    cb.Left = 12
+    cb.Top = 40
+    cb.Width = 380
+    for w in cands:
+        cb.Items.Add(w.Name)
+    cb.SelectedIndex = 0
+    f.Controls.Add(cb)
+    ok = WF.Button()
+    ok.Text = 'OK'
+    ok.Left = 232
+    ok.Top = 85
+    ok.DialogResult = WF.DialogResult.OK
+    f.Controls.Add(ok)
+    no = WF.Button()
+    no.Text = 'Cancel'
+    no.Left = 317
+    no.Top = 85
+    no.DialogResult = WF.DialogResult.Cancel
+    f.Controls.Add(no)
+    f.AcceptButton = ok
+    f.CancelButton = no
+    if f.ShowDialog() == WF.DialogResult.OK:
+        return cands[cb.SelectedIndex]
+    return None
+
+
+def fx_move_workset(ids, ws):
+    failures = []
+    done = 0
+    if not ws.IsEditable:
+        owner = ''
+        try:
+            owner = ws.Owner
+        except Exception:
+            pass
+        reason = 'Target workset "%s" is checked out by %s' % (ws.Name, owner or 'someone else')
+        for i in ids:
+            el = doc.GetElement(i)
+            if el is not None:
+                add_fail(failures, el, reason)
+        return '0 element(s) moved, %d skipped' % len(failures), failures
+    blocked = blockers(ids, check_pinned=False, check_group=True)
+    for i in ids:
+        el = doc.GetElement(i)
+        if el is None:
+            continue
+        r = blocked.get(eid_val(i)) or set_workset(el, ws)
+        if r:
+            add_fail(failures, el, r)
+        else:
+            done += 1
+    return '%d element(s) moved to "%s", %d skipped' % (done, ws.Name, len(failures)), failures
+
+
+def ask_workset_not_link(ids):
+    return choose_workset('Move the selected elements to which workset?', lambda n: 'link' in n.lower())
+
+
+def ask_workset_not_levels_grids(ids):
+    return choose_workset('Move the selected elements to which workset?',
+                          lambda n: 'level' in n.lower() and 'grid' in n.lower())
+
+
+LINK_WS_PREFIX = '*LINKED MODEL_'    # e.g. "*LINKED MODEL_CHB-SDT-PNS"
+
+
+def link_base_name(type_name):
+    """'CHB-SDT-PNS.rvt : 1' -> 'CHB-SDT-PNS'"""
+    return re.sub(r'(?i)\.rvt.*$', '', (type_name or '').split(' : ')[0]).strip()
+
+
+def ask_link_plan(ids):
+    """Decide (read-only) which workset every link should go to."""
+    if not doc.IsWorkshared:
+        WF.MessageBox.Show('This model is not workshared, so there are no worksets to move links to.',
+                           'Model Health Check')
+        return None
+    worksets = user_worksets()
+    plan = []
+    for i in ids:
+        li = doc.GetElement(i)
+        if li is None:
+            continue
+        t = doc.GetElement(li.GetTypeId())
+        base = link_base_name(safe_name(t) or safe_name(li))
+        target = LINK_WS_PREFIX + base
+        existing = None
+        for w in worksets:                                   # 1) exact name
+            if w.Name.strip().lower() == target.lower():
+                existing = w
+                break
+        if existing is None:                                 # 2) a link workset that mentions this link
+            for w in worksets:
+                n = w.Name.lower()
+                if 'link' in n and base.lower() in n:
+                    existing = w
+                    break
+        plan.append((i, base, existing, existing.Name if existing else target))
+    return plan
+
+
+def plan_link_lines(ids, plan):
+    lines = []
+    for i, base, existing, target in plan:
+        lines.append('%s  ->  %s%s' % (base, target, '' if existing else '  (new workset)'))
+    return lines
+
+
+def fx_link_workset(ids, plan):
+    failures = []
+    created = {}
+    done = 0
+    blocked = blockers([p[0] for p in plan], check_pinned=False)
+    for i, base, existing, target in plan:
+        li = doc.GetElement(i)
+        if li is None:
+            continue
+        r = blocked.get(eid_val(i))
+        if r:
+            add_fail(failures, li, r)
+            continue
+        try:
+            ws = existing
+            if ws is None:
+                if target not in created:
+                    created[target] = DB.Workset.Create(doc, target)
+                ws = created[target]
+        except Exception as ex:
+            add_fail(failures, li, 'Could not create workset "%s": %s' % (target, ex_text(ex)))
+            continue
+        r = set_workset(li, ws)
+        if r:
+            add_fail(failures, li, r)
+        else:
+            done += 1
+    return '%d link(s) moved, %d new workset(s) created, %d skipped' % (done, len(created), len(failures)), failures
+
+
+FIXERS = {
+    'Imported DWG file': [Fixer(
+        'Delete imported DWGs', fx_delete,
+        confirm='Delete {n} imported DWG instance(s)?\r\n\r\nThis removes the CAD geometry from the model. '
+                'Run "Unused Elements" afterwards and purge to clear the left-over layers and styles. '
+                'You can undo with Ctrl+Z.')],
+    'Link Model Workset': [Fixer(
+        'Move links to *LINKED MODEL_ worksets', fx_link_workset,
+        ask=ask_link_plan, plan=plan_link_lines,
+        confirm='Move {n} link(s) as follows? Missing worksets will be created.')],
+    'Revit Links overlay vs Attachment': [Fixer(
+        'Set links to Overlay', fx_overlay,
+        confirm='Change {n} link type(s) from Attachment to Overlay?')],
+    'Elements in Link Workset': [Fixer(
+        'Move to another workset...', fx_move_workset,
+        ask=ask_workset_not_link,
+        confirm='Move {n} element(s) off the link workset?')],
+    'WorksetPlacement': [Fixer(
+        'Move to another workset...', fx_move_workset,
+        ask=ask_workset_not_levels_grids,
+        confirm='Move {n} element(s) off the Levels and Grids workset?')],
+    'PinnedLinks': [Fixer('Pin all links', fx_pin)],
+    'UnusedElements': [Fixer(
+        'Purge unused', fx_delete,
+        confirm='Delete {n} unused element(s) (similar to Manage > Purge Unused)?\r\n\r\n'
+                'You can undo with Ctrl+Z.')],
+}
+
+# Manual guidance (from the Model QC guide) for checks that cannot be fixed safely by a script
+HINTS = {
+    'Generic Models': u'\u0e41\u0e01\u0e49\u0e40\u0e2d\u0e07: \u0e40\u0e1b\u0e34\u0e14 Family (Edit Family) \u0e41\u0e25\u0e49\u0e27\u0e40\u0e1b\u0e25\u0e35\u0e48\u0e22\u0e19 Category \u0e43\u0e2b\u0e49\u0e15\u0e23\u0e07\u0e0a\u0e19\u0e34\u0e14\u0e27\u0e31\u0e15\u0e16\u0e38 \u0e40\u0e0a\u0e48\u0e19 Mechanical Equipment / Electrical Fixtures \u0e16\u0e49\u0e32\u0e41\u0e01\u0e49\u0e44\u0e21\u0e48\u0e44\u0e14\u0e49\u0e43\u0e2b\u0e49\u0e2a\u0e23\u0e49\u0e32\u0e07 Family \u0e43\u0e2b\u0e21\u0e48\u0e41\u0e25\u0e49\u0e27\u0e27\u0e32\u0e07\u0e17\u0e31\u0e1a\u0e41\u0e17\u0e19 (\u0e2a\u0e04\u0e23\u0e34\u0e1b\u0e15\u0e4c\u0e40\u0e1b\u0e25\u0e35\u0e48\u0e22\u0e19 Category \u0e43\u0e2b\u0e49\u0e44\u0e21\u0e48\u0e44\u0e14\u0e49 \u0e40\u0e1e\u0e23\u0e32\u0e30\u0e15\u0e49\u0e2d\u0e07\u0e23\u0e39\u0e49\u0e27\u0e48\u0e32\u0e27\u0e31\u0e15\u0e16\u0e38\u0e04\u0e37\u0e2d\u0e2d\u0e30\u0e44\u0e23)',
+    'In-Place Families': u'\u0e41\u0e01\u0e49\u0e40\u0e2d\u0e07: \u0e16\u0e49\u0e32\u0e43\u0e0a\u0e49\u0e2b\u0e25\u0e32\u0e22\u0e15\u0e33\u0e41\u0e2b\u0e19\u0e48\u0e07 \u0e43\u0e2b\u0e49\u0e2a\u0e23\u0e49\u0e32\u0e07\u0e40\u0e1b\u0e47\u0e19 Loadable Family (.rfa) \u0e41\u0e25\u0e49\u0e27\u0e42\u0e2b\u0e25\u0e14\u0e41\u0e17\u0e19\u0e02\u0e2d\u0e07\u0e40\u0e14\u0e34\u0e21 \u0e16\u0e49\u0e32\u0e40\u0e1b\u0e47\u0e19\u0e07\u0e32\u0e19\u0e1e\u0e34\u0e40\u0e28\u0e29\u0e0a\u0e34\u0e49\u0e19\u0e40\u0e14\u0e35\u0e22\u0e27\u0e04\u0e07\u0e44\u0e27\u0e49\u0e44\u0e14\u0e49 \u0e41\u0e15\u0e48\u0e43\u0e2b\u0e49\u0e19\u0e49\u0e2d\u0e22\u0e17\u0e35\u0e48\u0e2a\u0e38\u0e14',
+    'Imported DWG file': u'\u0e41\u0e19\u0e30\u0e19\u0e33: \u0e25\u0e1a DWG \u0e17\u0e35\u0e48 Import \u0e17\u0e34\u0e49\u0e07 (\u0e1b\u0e38\u0e48\u0e21 Fix) \u0e41\u0e25\u0e49\u0e27 Purge Unused \u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07 \u0e2b\u0e32\u0e01\u0e08\u0e33\u0e40\u0e1b\u0e47\u0e19\u0e15\u0e49\u0e2d\u0e07\u0e43\u0e0a\u0e49\u0e40\u0e1b\u0e47\u0e19 Reference \u0e43\u0e2b\u0e49\u0e43\u0e0a\u0e49 Link CAD \u0e41\u0e17\u0e19 Import CAD',
+    'Link Model Workset': u'Workset ของ Link ตั้งชื่อรูปแบบ *LINKED MODEL_<ชื่อไฟล์ Link> เช่น *LINKED MODEL_CHB-SDT-PNS ปุ่ม Fix จะย้าย Link เข้า Workset ชื่อนี้ (ถ้ายังไม่มีจะสร้างให้) ตอน Link ไฟล์ใหม่ให้เลือก Place on: เป็น Workset นี้ตั้งแต่แรก',
+    'Elements in Link Workset': u'\u0e27\u0e31\u0e15\u0e16\u0e38\u0e02\u0e2d\u0e07\u0e40\u0e23\u0e32\u0e44\u0e21\u0e48\u0e04\u0e27\u0e23\u0e2d\u0e22\u0e39\u0e48\u0e1a\u0e19 Workset \u0e02\u0e2d\u0e07 Link \u0e43\u0e0a\u0e49\u0e1b\u0e38\u0e48\u0e21 Move \u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e22\u0e49\u0e32\u0e22\u0e44\u0e1b Workset \u0e17\u0e35\u0e48\u0e16\u0e39\u0e01\u0e15\u0e49\u0e2d\u0e07 \u0e16\u0e49\u0e32\u0e40\u0e1b\u0e47\u0e19\u0e27\u0e31\u0e15\u0e16\u0e38\u0e08\u0e32\u0e01\u0e44\u0e1f\u0e25\u0e4c Link \u0e08\u0e23\u0e34\u0e07 \u0e46 \u0e2d\u0e32\u0e08\u0e40\u0e01\u0e34\u0e14\u0e08\u0e32\u0e01\u0e01\u0e32\u0e23 Bind Link',
+    'Unhosted Family': u'Family ที่ Host หายไป (Orphaned): ห้ามลบ เครื่องมือนี้ยังไม่แก้ให้ ใช้ Select in Revit เพื่อดูแล้วตรวจสอบเอง',
+}
+
+
+def fixers_for(chk):
+    key = chk.name if chk.type == 'Custom' else chk.type
+    return FIXERS.get(key, [])
+
+
+# ----------------------------------------------------------------------------
+# UI  (modeless window + ExternalEvent so Revit stays usable)
+# ----------------------------------------------------------------------------
+APPDOMAIN_KEY = 'NRK_ModelHealthCheck_Form'
+
 STATUS_COLORS = {
     'PASS': SD.Color.FromArgb(198, 239, 206),
     'FAIL': SD.Color.FromArgb(255, 199, 206),
@@ -822,6 +1324,7 @@ STATUS_COLORS = {
     'SKIP': SD.Color.FromArgb(230, 230, 230),
     'ERROR': SD.Color.FromArgb(230, 200, 240),
 }
+ISSUE_STATUSES = ('FAIL', 'WARN', 'ERROR')
 
 LAST_XML_FILE = os.path.join(os.environ.get('APPDATA', ''), 'pyRevit', 'NRK_ModelHealthCheck_lastxml.txt')
 
@@ -846,23 +1349,172 @@ def csv_cell(v):
     return '"' + v.replace('"', '""') + '"'
 
 
-class HealthForm(WF.Form):
+class RevitWindow(WF.IWin32Window):
+    """Makes the Revit main window the owner so our window stays above it."""
+    def __init__(self, handle):
+        self._handle = handle
+
+    @property
+    def Handle(self):
+        return self._handle
+
+
+class _Handler(UI.IExternalEventHandler):
+    """Runs queued jobs inside a valid Revit API context."""
     def __init__(self):
+        self.queue = []
+        self.on_error = None
+
+    def Execute(self, uiapp_):
+        global uidoc, doc, app
+        uidoc = uiapp_.ActiveUIDocument
+        doc = uidoc.Document if uidoc is not None else None
+        app = uiapp_.Application
+        while self.queue:
+            job = self.queue.pop(0)
+            try:
+                job()
+            except Exception as ex:
+                if self.on_error:
+                    self.on_error(ex)
+
+    def GetName(self):
+        return 'NRK Model Health Check'
+
+
+def make_double_buffered(ctrl):
+    try:
+        flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic
+        ctrl.GetType().GetProperty('DoubleBuffered', flags).SetValue(ctrl, True, None)
+    except Exception:
+        pass
+
+
+class HealthForm(WF.Form):
+    def __init__(self, handler, event):
         WF.Form.__init__(self)
+        self.handler = handler
+        self.event = event
+        self._appdomain = System.AppDomain          # kept on the instance: no global lookup at close time
+        self._appdomain_key = APPDOMAIN_KEY
+        handler.on_error = self.show_error
         self.checks = []
         self.results = {}
+        self.rows = {}                  # id(chk) -> ListViewItem
+        self.current = None             # CheckDef shown on the right
         self.cancel = False
-        self.select_ids = None
+        self.busy = False
+        self.building = False
+        self.model_title = None
+        self.fail_notes = {}            # eid -> why the last fix could not change it
+
         self.Text = 'Model Health Check'
-        self.Width = 1280
-        self.Height = 780
+        self.Width = 1300
+        self.Height = 800
+        self.MinimumSize = SD.Size(980, 560)
         self.StartPosition = WF.FormStartPosition.CenterScreen
         self.Font = SD.Font('Segoe UI', 9.0)
+        self.KeyPreview = True
+        self.KeyDown += self.on_key
 
-        # --- main split
+        self.build_top()
+        self.build_main()
+        self.build_status()
+        # docking order: Fill first, then Top / Bottom
+        self.Controls.Add(self.split)
+        self.Controls.Add(self.top)
+        self.Controls.Add(self.status)
+
+        self.Shown += self.on_shown
+        self.FormClosed += self.on_closed
+
+    # ------------------------------------------------------------ layout
+    def build_top(self):
+        self.top = WF.Panel()
+        self.top.Dock = WF.DockStyle.Top
+        self.top.Height = 70
+        self.top.Padding = WF.Padding(8, 6, 8, 4)
+
+        l1 = WF.Label()
+        l1.Text = 'Model:'
+        l1.Left = 8
+        l1.Top = 9
+        l1.AutoSize = True
+        self.top.Controls.Add(l1)
+        self.lbl_model = WF.Label()
+        self.lbl_model.Left = 90
+        self.lbl_model.Top = 8
+        self.lbl_model.AutoSize = True
+        self.lbl_model.Font = SD.Font('Segoe UI', 10.0, SD.FontStyle.Bold)
+        self.lbl_model.Text = '-'
+        self.top.Controls.Add(self.lbl_model)
+
+        l2 = WF.Label()
+        l2.Text = 'Check set XML:'
+        l2.Left = 8
+        l2.Top = 41
+        l2.AutoSize = True
+        self.top.Controls.Add(l2)
+        self.txt_xml = WF.TextBox()
+        self.txt_xml.Left = 90
+        self.txt_xml.Top = 38
+        self.txt_xml.Width = 960
+        self.txt_xml.ReadOnly = True
+        self.txt_xml.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Left | WF.AnchorStyles.Right
+        self.top.Controls.Add(self.txt_xml)
+        b = WF.Button()
+        b.Text = 'Browse...'
+        b.Left = 1060
+        b.Top = 36
+        b.Width = 80
+        b.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
+        b.Click += self.on_browse
+        self.top.Controls.Add(b)
+        b2 = WF.Button()
+        b2.Text = 'Reload'
+        b2.Left = 1146
+        b2.Top = 36
+        b2.Width = 70
+        b2.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
+        b2.Click += lambda s, e: self.load_checks()
+        self.top.Controls.Add(b2)
+
+    def build_main(self):
         self.split = WF.SplitContainer()
         self.split.Dock = WF.DockStyle.Fill
         self.split.SplitterDistance = 560
+
+        # ---- left: filter bar, list, buttons
+        lbar = WF.Panel()
+        lbar.Dock = WF.DockStyle.Top
+        lbar.Height = 32
+        lbl = WF.Label()
+        lbl.Text = 'Search:'
+        lbl.Left = 4
+        lbl.Top = 9
+        lbl.AutoSize = True
+        lbar.Controls.Add(lbl)
+        self.txt_search = WF.TextBox()
+        self.txt_search.Left = 56
+        self.txt_search.Top = 5
+        self.txt_search.Width = 230
+        self.txt_search.TextChanged += lambda s, e: self.refresh_list()
+        lbar.Controls.Add(self.txt_search)
+        self.chk_issues = WF.CheckBox()
+        self.chk_issues.Text = 'Issues only'
+        self.chk_issues.Left = 300
+        self.chk_issues.Top = 6
+        self.chk_issues.AutoSize = True
+        self.chk_issues.CheckedChanged += lambda s, e: self.refresh_list()
+        lbar.Controls.Add(self.chk_issues)
+
+        lbtm = WF.Panel()
+        lbtm.Dock = WF.DockStyle.Bottom
+        lbtm.Height = 40
+        self.btn_run_sel = self.make_button(lbtm, 'Run selected (F5)', 4, 6, self.on_run_selected, 130)
+        self.btn_run_all = self.make_button(lbtm, 'Run all ticked', 140, 6, self.on_run_ticked, 110)
+        self.make_button(lbtm, 'Tick all', 258, 6, lambda s, e: self.tick_all(True), 65)
+        self.make_button(lbtm, 'Tick none', 328, 6, lambda s, e: self.tick_all(False), 75)
 
         self.lv = WF.ListView()
         self.lv.Dock = WF.DockStyle.Fill
@@ -872,12 +1524,49 @@ class HealthForm(WF.Form):
         self.lv.GridLines = True
         self.lv.HideSelection = False
         self.lv.MultiSelect = False
-        self.lv.Columns.Add('Check', 250)
-        self.lv.Columns.Add('Section', 80)
-        self.lv.Columns.Add('Status', 70)
-        self.lv.Columns.Add('Count', 55)
-        self.lv.SelectedIndexChanged += self.on_select
+        self.lv.Columns.Add('Check', 260)
+        self.lv.Columns.Add('Section', 85)
+        self.lv.Columns.Add('Status', 65)
+        self.lv.Columns.Add('Count', 50)
+        make_double_buffered(self.lv)
+        self.lv.SelectedIndexChanged += self.on_check_selected
+        self.lv.ItemChecked += self.on_item_checked
+        self.lv.DoubleClick += self.on_run_selected
         self.split.Panel1.Controls.Add(self.lv)
+        self.split.Panel1.Controls.Add(lbar)
+        self.split.Panel1.Controls.Add(lbtm)
+
+        # ---- right: title, message, items, buttons
+        self.lbl_title = WF.Label()
+        self.lbl_title.Dock = WF.DockStyle.Top
+        self.lbl_title.Height = 28
+        self.lbl_title.Font = SD.Font('Segoe UI', 11.0, SD.FontStyle.Bold)
+        self.lbl_title.Padding = WF.Padding(4, 4, 0, 0)
+        self.lbl_title.Text = 'Select a check on the left'
+
+        self.msg = WF.TextBox()
+        self.msg.Dock = WF.DockStyle.Top
+        self.msg.Multiline = True
+        self.msg.ReadOnly = True
+        self.msg.Height = 92
+        self.msg.BorderStyle = getattr(WF.BorderStyle, 'None')
+        self.msg.BackColor = SD.Color.FromArgb(245, 245, 245)
+        self.msg.ScrollBars = WF.ScrollBars.Vertical
+
+        rbtm = WF.Panel()
+        rbtm.Dock = WF.DockStyle.Bottom
+        rbtm.Height = 40
+        self.make_button(rbtm, 'Select in Revit', 4, 6, self.on_select_clicked, 105)
+        self.make_button(rbtm, 'Zoom to', 114, 6, self.on_zoom_clicked, 75)
+        self.chk_auto = WF.CheckBox()
+        self.chk_auto.Text = 'Auto-select when I click a row'
+        self.chk_auto.Left = 200
+        self.chk_auto.Top = 11
+        self.chk_auto.AutoSize = True
+        self.chk_auto.Checked = True
+        rbtm.Controls.Add(self.chk_auto)
+        b = self.make_button(rbtm, 'Export CSV', 400, 6, self.on_export, 90)
+        b.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
 
         self.dv = WF.ListView()
         self.dv.Dock = WF.DockStyle.Fill
@@ -885,91 +1574,100 @@ class HealthForm(WF.Form):
         self.dv.FullRowSelect = True
         self.dv.GridLines = True
         self.dv.MultiSelect = True
-        self.dv.Columns.Add('Item', 430)
+        self.dv.HideSelection = False
+        self.dv.Columns.Add('Item', 420)
         self.dv.Columns.Add('Element Id', 80)
-        self.dv.Columns.Add('Info', 300)
+        self.dv.Columns.Add('Info', 420)
+        make_double_buffered(self.dv)
+        self.dv.SelectedIndexChanged += self.on_item_selected
+        self.dv.DoubleClick += self.on_zoom_clicked
+
+        self.fix_panel = WF.FlowLayoutPanel()
+        self.fix_panel.Dock = WF.DockStyle.Top
+        self.fix_panel.AutoSize = True
+        self.fix_panel.AutoSizeMode = WF.AutoSizeMode.GrowAndShrink
+        self.fix_panel.Padding = WF.Padding(0, 4, 0, 4)
+        self.fix_panel.Visible = False
+
         self.split.Panel2.Controls.Add(self.dv)
-
-        self.msg = WF.TextBox()
-        self.msg.Dock = WF.DockStyle.Top
-        self.msg.Multiline = True
-        self.msg.ReadOnly = True
-        self.msg.Height = 70
-        self.msg.ScrollBars = WF.ScrollBars.Vertical
+        self.split.Panel2.Controls.Add(self.fix_panel)
         self.split.Panel2.Controls.Add(self.msg)
+        self.split.Panel2.Controls.Add(self.lbl_title)
+        self.split.Panel2.Controls.Add(rbtm)
 
-        # --- top bar
-        top = WF.Panel()
-        top.Dock = WF.DockStyle.Top
-        top.Height = 38
-        lbl = WF.Label()
-        lbl.Text = 'Check set XML:'
-        lbl.Left = 8
-        lbl.Top = 11
-        lbl.AutoSize = True
-        top.Controls.Add(lbl)
-        self.txt_xml = WF.TextBox()
-        self.txt_xml.Left = 105
-        self.txt_xml.Top = 8
-        self.txt_xml.Width = 900
-        self.txt_xml.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Left | WF.AnchorStyles.Right
-        top.Controls.Add(self.txt_xml)
-        btn_browse = WF.Button()
-        btn_browse.Text = 'Browse...'
-        btn_browse.Left = 1015
-        btn_browse.Top = 6
-        btn_browse.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
-        btn_browse.Click += self.on_browse
-        top.Controls.Add(btn_browse)
-        btn_load = WF.Button()
-        btn_load.Text = 'Reload'
-        btn_load.Left = 1100
-        btn_load.Top = 6
-        btn_load.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
-        btn_load.Click += self.on_reload
-        top.Controls.Add(btn_load)
-
-        # --- bottom bar
-        bottom = WF.Panel()
-        bottom.Dock = WF.DockStyle.Bottom
-        bottom.Height = 70
-        self.btn_run = self._button(bottom, 'Run checks', 8, 6, self.on_run)
-        self.btn_stop = self._button(bottom, 'Stop', 100, 6, self.on_stop)
+    def build_status(self):
+        self.status = WF.Panel()
+        self.status.Dock = WF.DockStyle.Bottom
+        self.status.Height = 34
+        self.pb = WF.ProgressBar()
+        self.pb.Left = 8
+        self.pb.Top = 8
+        self.pb.Width = 220
+        self.pb.Height = 18
+        self.status.Controls.Add(self.pb)
+        self.btn_stop = self.make_button(self.status, 'Stop', 236, 4, self.on_stop, 60)
         self.btn_stop.Enabled = False
-        self._button(bottom, 'All', 190, 6, lambda s, e: self.tick_all(True), 45)
-        self._button(bottom, 'None', 240, 6, lambda s, e: self.tick_all(False), 45)
-        self._button(bottom, 'Select in Revit && close', 300, 6, self.on_select_revit, 160)
-        self._button(bottom, 'Export CSV', 470, 6, self.on_export)
-        self._button(bottom, 'Close', 562, 6, lambda s, e: self.Close(), 70)
         self.lbl_sum = WF.Label()
-        self.lbl_sum.Left = 8
-        self.lbl_sum.Top = 40
+        self.lbl_sum.Left = 308
+        self.lbl_sum.Top = 9
         self.lbl_sum.AutoSize = True
-        self.lbl_sum.Text = ''
-        bottom.Controls.Add(self.lbl_sum)
+        self.lbl_sum.Text = 'Ready'
+        self.status.Controls.Add(self.lbl_sum)
 
-        self.Controls.Add(self.split)
-        self.Controls.Add(top)
-        self.Controls.Add(bottom)
-
-        self.Shown += self.on_shown
-
-    def _button(self, parent, text, left, top, handler, width=85):
+    def make_button(self, parent, text, left, top, handler, width=85):
         b = WF.Button()
         b.Text = text
         b.Left = left
         b.Top = top
         b.Width = width
-        b.Height = 28
+        b.Height = 26
         b.Click += handler
         parent.Controls.Add(b)
         return b
 
-    # ---- loading
+    # ------------------------------------------------------------ plumbing
+    def post(self, job):
+        """Queue a job that needs the Revit API and wake the external event."""
+        self.handler.queue.append(job)
+        self.event.Raise()
+
+    def show_error(self, ex):
+        self.busy = False
+        self.btn_stop.Enabled = False
+        self.btn_run_sel.Enabled = True
+        self.btn_run_all.Enabled = True
+        self.lbl_sum.Text = 'Error: %s' % ex
+        WF.MessageBox.Show('Something went wrong:\r\n%s' % ex, 'Model Health Check')
+
+    def sync_model(self):
+        """Called inside a job: keep the title current, drop stale results."""
+        title = doc.Title if doc is not None else '(no model open)'
+        if self.model_title is not None and title != self.model_title:
+            self.results = {}
+            self.fail_notes = {}
+            self.refresh_list()
+            self.show_details()
+        self.model_title = title
+        self.lbl_model.Text = title
+
     def on_shown(self, s, e):
         self.txt_xml.Text = default_xml()
         self.load_checks()
+        self.post(self.sync_model)
 
+    def on_closed(self, s, e):
+        self.cancel = True
+        try:
+            self._appdomain.CurrentDomain.SetData(self._appdomain_key, None)
+        except Exception:
+            pass
+
+    def on_key(self, s, e):
+        if e.KeyCode == WF.Keys.F5:
+            self.on_run_selected(None, None)
+            e.Handled = True
+
+    # ------------------------------------------------------------ loading
     def on_browse(self, s, e):
         dlg = WF.OpenFileDialog()
         dlg.Filter = 'Check set XML (*.xml)|*.xml'
@@ -977,17 +1675,15 @@ class HealthForm(WF.Form):
             self.txt_xml.Text = dlg.FileName
             self.load_checks()
 
-    def on_reload(self, s, e):
-        self.load_checks()
-
     def load_checks(self):
         path = self.txt_xml.Text.strip()
-        self.lv.Items.Clear()
-        self.dv.Items.Clear()
         self.results = {}
-        self.lbl_sum.Text = ''
+        self.checks = []
+        self.current = None
+        self.refresh_list()
+        self.show_details()
         if not path or not os.path.exists(path):
-            self.msg.Text = 'Select the check set XML file first.'
+            self.msg.Text = 'Select the check set XML file first (Browse...).'
             return
         try:
             self.checks, name = parse_checkset(path)
@@ -999,9 +1695,28 @@ class HealthForm(WF.Form):
         except Exception:
             pass
         self.Text = 'Model Health Check  -  %s' % name
-        groups = {}
+        self.refresh_list()
+        self.lbl_sum.Text = '%d checks loaded' % len(self.checks)
+        self.msg.Text = ('Double-click a check (or press F5) to run just that one. '
+                         'Use "Run all ticked" before you submit the model.')
+
+    # ------------------------------------------------------------ left list
+    def refresh_list(self):
+        self.building = True
+        keep = self.current
+        text = self.txt_search.Text.strip().lower()
+        issues_only = self.chk_issues.Checked
         self.lv.BeginUpdate()
+        self.lv.Items.Clear()
+        self.lv.Groups.Clear()
+        self.rows = {}
+        groups = {}
         for chk in self.checks:
+            res = self.results.get(id(chk))
+            if text and text not in chk.name.lower() and text not in chk.section.lower():
+                continue
+            if issues_only and res is not None and res.status not in ISSUE_STATUSES:
+                continue
             if chk.heading not in groups:
                 g = WF.ListViewGroup(chk.heading, chk.heading)
                 self.lv.Groups.Add(g)
@@ -1009,125 +1724,283 @@ class HealthForm(WF.Form):
             label = chk.name + ('  (slow)' if chk.type in SLOW_TYPES else '')
             it = WF.ListViewItem(label)
             it.SubItems.Add(chk.section)
-            it.SubItems.Add('Not run')
-            it.SubItems.Add('')
+            it.SubItems.Add(res.status if res else 'Not run')
+            it.SubItems.Add(str(res.count) if (res and res.count) else '')
+            if res:
+                it.BackColor = STATUS_COLORS.get(res.status, SD.Color.White)
             it.Checked = chk.checked
             it.Tag = chk
             it.Group = groups[chk.heading]
             self.lv.Items.Add(it)
+            self.rows[id(chk)] = it
+            if chk is keep:
+                it.Selected = True
         self.lv.EndUpdate()
-        self.msg.Text = '%d checks loaded from "%s". Untick any you want to skip, then press Run.' % (len(self.checks), name)
+        self.building = False
+
+    def on_item_checked(self, s, e):
+        if not self.building and e.Item.Tag is not None:
+            e.Item.Tag.checked = e.Item.Checked
 
     def tick_all(self, state):
-        for it in self.lv.Items:
-            it.Checked = state
+        for chk in self.checks:
+            chk.checked = state
+        self.refresh_list()
 
-    # ---- run
+    def on_check_selected(self, s, e):
+        if self.building or self.lv.SelectedItems.Count == 0:
+            return
+        self.current = self.lv.SelectedItems[0].Tag
+        self.show_details()
+
+    # ------------------------------------------------------------ running
+    def selected_check(self):
+        if self.lv.SelectedItems.Count:
+            return self.lv.SelectedItems[0].Tag
+        return self.current
+
+    def on_run_selected(self, s, e):
+        chk = self.selected_check()
+        if chk is None or self.busy:
+            return
+        self.set_busy(True)
+        self.post(lambda: self.do_run([chk]))
+
+    def on_run_ticked(self, s, e):
+        chks = [c for c in self.checks if c.checked]
+        if not chks or self.busy:
+            return
+        self.set_busy(True)
+        self.post(lambda: self.do_run(chks))
+
     def on_stop(self, s, e):
         self.cancel = True
+
+    def set_busy(self, state):
+        self.busy = state
+        self.btn_run_sel.Enabled = not state
+        self.btn_run_all.Enabled = not state
+        self.btn_stop.Enabled = state
+        if state:
+            self.cancel = False
 
     def set_progress(self, text):
         self.lbl_sum.Text = text
         WF.Application.DoEvents()
 
-    def on_run(self, s, e):
-        if not self.checks:
-            return
-        self.cancel = False
-        self.btn_run.Enabled = False
-        self.btn_stop.Enabled = True
-        self.results = {}
+    def do_run(self, chks):
+        self.sync_model()
         t0 = time.time()
         ctx = Ctx(progress=self.set_progress, cancelled=lambda: self.cancel)
-        for it in self.lv.Items:
-            it.SubItems[2].Text = 'Not run' if not it.Checked else '...'
-            it.SubItems[3].Text = ''
-            it.BackColor = SD.Color.White
-        WF.Application.DoEvents()
-        for it in list(self.lv.Items):
+        self.pb.Maximum = max(len(chks), 1)
+        self.pb.Value = 0
+        done = 0
+        for chk in chks:
             if self.cancel:
                 break
-            if not it.Checked:
-                continue
-            chk = it.Tag
-            it.SubItems[2].Text = 'Running'
+            row = self.rows.get(id(chk))
+            if row is not None:
+                row.SubItems[2].Text = 'Running'
             self.set_progress('Running: ' + chk.name)
             try:
                 res = run_check(ctx, chk)
             except Exception as ex:
                 res = Result('ERROR', str(ex))
             self.results[id(chk)] = res
-            it.SubItems[2].Text = res.status
-            it.SubItems[3].Text = str(res.count) if res.count else ''
-            it.BackColor = STATUS_COLORS.get(res.status, SD.Color.White)
-        self.btn_run.Enabled = True
-        self.btn_stop.Enabled = False
+            if row is not None:
+                row.SubItems[2].Text = res.status
+                row.SubItems[3].Text = str(res.count) if res.count else ''
+                row.BackColor = STATUS_COLORS.get(res.status, SD.Color.White)
+            done += 1
+            self.pb.Value = done
+            WF.Application.DoEvents()
+        self.set_busy(False)
         self.update_summary(time.time() - t0)
-        self.on_select(None, None)
+        if self.chk_issues.Checked:
+            self.refresh_list()
+        self.show_details()
 
     def update_summary(self, secs):
         tally = {}
         for r in self.results.values():
             tally[r.status] = tally.get(r.status, 0) + 1
         parts = ['%s %d' % (k, tally[k]) for k in ('FAIL', 'WARN', 'PASS', 'INFO', 'SKIP', 'ERROR') if k in tally]
-        self.lbl_sum.Text = '%s   (%.0f s)%s' % ('   |   '.join(parts), secs, '   - stopped' if self.cancel else '')
+        self.lbl_sum.Text = '%s    (%.0f s)%s' % ('  |  '.join(parts), secs, '   - stopped' if self.cancel else '')
 
-    # ---- details
-    def current_check(self):
-        if self.lv.SelectedItems.Count == 0:
-            return None, None
-        chk = self.lv.SelectedItems[0].Tag
-        return chk, self.results.get(id(chk))
-
-    def on_select(self, s, e):
-        chk, res = self.current_check()
+    # ------------------------------------------------------------ details
+    def show_details(self):
+        chk = self.current
         self.dv.Items.Clear()
+        self.fix_panel.Controls.Clear()
+        self.fix_panel.Visible = False
         if chk is None:
+            self.lbl_title.Text = 'Select a check on the left'
             return
+        self.lbl_title.Text = chk.name
+        res = self.results.get(id(chk))
         head = chk.description or ''
+        hint = HINTS.get(chk.name)
+        tail = (u'\r\n' + hint) if hint else u''
         if res is None:
-            self.msg.Text = head + '\r\n\r\nNot run yet.'
+            self.msg.Text = (head + '\r\n\r\n' if head else '') + 'Not run yet - double-click the check or press F5.' + tail
             return
-        self.msg.Text = '%s: %s\r\n%s' % (res.status, res.message, head)
+        self.msg.Text = u'%s: %s\r\n%s%s' % (res.status, res.message, head, tail)
         self.dv.BeginUpdate()
         for text, eid, extra in res.items[:MAX_ROWS]:
             li = WF.ListViewItem(text)
             li.SubItems.Add(str(eid_val(eid)) if eid is not None else '')
-            li.SubItems.Add(extra or '')
+            note = self.fail_notes.get(eid_val(eid)) if eid is not None else None
+            if note:
+                li.SubItems.Add('FIX FAILED: ' + note)
+                li.BackColor = STATUS_COLORS['FAIL']
+            else:
+                li.SubItems.Add(extra or '')
             li.Tag = eid
             self.dv.Items.Add(li)
         if len(res.items) > MAX_ROWS:
             self.dv.Items.Add(WF.ListViewItem('... %d more (see CSV export)' % (len(res.items) - MAX_ROWS)))
         self.dv.EndUpdate()
+        if res.items:
+            for fx in fixers_for(chk):
+                b = WF.Button()
+                b.Text = 'Fix: ' + fx.label
+                b.AutoSize = True
+                b.Click += (lambda s_, e_, fx_=fx: self.on_fix(chk, fx_))
+                self.fix_panel.Controls.Add(b)
+            self.fix_panel.Visible = self.fix_panel.Controls.Count > 0
 
-    def on_select_revit(self, s, e):
-        chk, res = self.current_check()
+    def picked_ids(self, selected_only=True):
+        ids = [li.Tag for li in self.dv.SelectedItems if li.Tag is not None]
+        if not ids and not selected_only:
+            ids = [li.Tag for li in self.dv.Items if li.Tag is not None]
+        return ids
+
+    def on_item_selected(self, s, e):
+        if self.chk_auto.Checked and not self.busy:
+            ids = self.picked_ids()
+            if ids:
+                self.post(lambda: self.reveal(ids, False))
+
+    def on_select_clicked(self, s, e):
+        ids = self.picked_ids(False)
+        if ids:
+            self.post(lambda: self.reveal(ids, False))
+
+    def on_zoom_clicked(self, s, e):
+        ids = self.picked_ids(False)
+        if ids:
+            self.post(lambda: self.reveal(ids, True))
+
+    def reveal(self, ids, zoom):
+        """Runs inside a job: select (and optionally zoom to) elements."""
+        self.sync_model()
+        if doc is None:
+            return
+        els = [doc.GetElement(i) for i in ids]
+        els = [x for x in els if x is not None]
+        # a single view / sheet: open it
+        if len(els) == 1 and isinstance(els[0], DB.View) and not els[0].IsTemplate:
+            uidoc.ActiveView = els[0]
+            return
+        lst = List[DB.ElementId]()
+        for x in els:
+            if not isinstance(x, DB.View):
+                lst.Add(x.Id)
+        if lst.Count == 0:
+            return
+        try:
+            uidoc.Selection.SetElementIds(lst)
+            if zoom:
+                uidoc.ShowElements(lst)
+        except Exception:
+            self.lbl_sum.Text = 'These elements cannot be selected in the current view'
+
+    # ------------------------------------------------------------ fixing
+    def on_fix(self, chk, fixer):
+        if self.busy:
+            return
+        res = self.results.get(id(chk))
         if res is None:
             return
-        picked = [li.Tag for li in self.dv.SelectedItems if li.Tag is not None]
-        if not picked:
-            picked = [i for _, i, _ in res.items if i is not None]
-        if not picked:
-            WF.MessageBox.Show('This check has no elements to select.', 'Model Health Check')
+        ids = [li.Tag for li in self.dv.SelectedItems if li.Tag is not None]
+        if not ids:
+            ids = [i for _, i, _ in res.items if i is not None]
+        if not ids:
             return
-        self.select_ids = picked
-        self.Close()
+        self.set_busy(True)
+        self.post(lambda: self.do_fix(chk, fixer, ids))
 
-    # ---- export
+    def do_fix(self, chk, fixer, ids):
+        """Runs inside a job (valid Revit API context)."""
+        try:
+            self.sync_model()
+            live = [i for i in ids if doc is not None and doc.GetElement(i) is not None]
+            if not live:
+                WF.MessageBox.Show('Nothing to fix - the elements no longer exist.', 'Model Health Check')
+                return
+            extra = None
+            if fixer.ask is not None:
+                extra = fixer.ask(live)
+                if extra is None:
+                    return
+            if fixer.confirm:
+                text = fixer.confirm.replace('{n}', str(len(live)))
+                if fixer.plan is not None:
+                    lines = fixer.plan(live, extra)
+                    text += '\r\n\r\n' + '\r\n'.join(lines[:15])
+                    if len(lines) > 15:
+                        text += '\r\n... and %d more' % (len(lines) - 15)
+                if WF.MessageBox.Show(text, 'Model Health Check - ' + fixer.label,
+                                      WF.MessageBoxButtons.OKCancel,
+                                      WF.MessageBoxIcon.Warning) != WF.DialogResult.OK:
+                    return
+            pre = FailLog()
+            t = DB.Transaction(doc, 'Model Health Check: ' + fixer.label)
+            t.Start()
+            opts = t.GetFailureHandlingOptions()
+            opts.SetFailuresPreprocessor(pre)
+            t.SetFailureHandlingOptions(opts)
+            failures = []
+            summary = ''
+            try:
+                summary, failures = fixer.fn(live, extra)
+                status = t.Commit()
+            except Exception:
+                t.RollBack()
+                raise
+            self.fail_notes = {}
+            if status != DB.TransactionStatus.Committed:
+                why = '; '.join(pre.messages) if pre.messages else 'status: %s' % status
+                show_fix_report('Model Health Check - fix rolled back',
+                                'Revit rejected the change, so NOTHING was changed.',
+                                [(None, '(whole fix)', why)])
+            else:
+                for e_, d_, r_ in failures:
+                    if e_ is not None:
+                        self.fail_notes[eid_val(e_)] = r_
+                if pre.messages:
+                    summary += '\r\nRevit warnings: ' + '; '.join(pre.messages[:3])
+                show_fix_report('Model Health Check - fix report', summary, failures)
+        finally:
+            self.set_busy(False)
+        # re-run only this check so the list shows what is left
+        self.set_busy(True)
+        self.do_run([chk])
+
+    # ------------------------------------------------------------ export
     def on_export(self, s, e):
         if not self.results:
-            WF.MessageBox.Show('Run the checks first.', 'Model Health Check')
+            WF.MessageBox.Show('Run at least one check first.', 'Model Health Check')
             return
         dlg = WF.SaveFileDialog()
         dlg.Filter = 'CSV (*.csv)|*.csv'
-        dlg.FileName = 'ModelHealthCheck_%s_%s.csv' % (
-            re.sub(r'[^\w\-]+', '_', os.path.splitext(doc.Title)[0]), time.strftime('%Y%m%d_%H%M'))
+        title = os.path.splitext(self.model_title or 'model')[0]
+        dlg.FileName = 'ModelHealthCheck_%s_%s.csv' % (re.sub(r'[^\w\-]+', '_', title), time.strftime('%Y%m%d_%H%M'))
         if dlg.ShowDialog() != WF.DialogResult.OK:
             return
         lines = [','.join(csv_cell(h) for h in
                           ('Priority', 'Section', 'Check', 'Status', 'Message', 'Item', 'ElementId', 'Info'))]
-        for it in self.lv.Items:
-            chk = it.Tag
+        for chk in self.checks:
             res = self.results.get(id(chk))
             if res is None:
                 continue
@@ -1139,20 +2012,46 @@ class HealthForm(WF.Form):
                                       (chk.heading, chk.section, chk.name, res.status, res.message,
                                        text, eid_val(eid) if eid is not None else '', extra)))
         System.IO.File.WriteAllText(dlg.FileName, '\r\n'.join(lines), System.Text.UTF8Encoding(True))
-        WF.MessageBox.Show('Saved: ' + dlg.FileName, 'Model Health Check')
+        self.lbl_sum.Text = 'Saved: ' + dlg.FileName
 
+
+
+def _guard_class(cls):
+    import types
+    for name in list(cls.__dict__.keys()):
+        if name.startswith('__'):
+            continue
+        member = cls.__dict__[name]
+        if isinstance(member, types.FunctionType):
+            setattr(cls, name, _guard(member))
+
+
+_guard_class(HealthForm)
+_guard_class(_Handler)
+_guard_class(FailLog)
 
 def main():
-    form = HealthForm()
-    form.ShowDialog()
-    if form.select_ids:
-        ids = List[DB.ElementId]()
-        for i in form.select_ids:
-            ids.Add(i)
-        try:
-            uidoc.Selection.SetElementIds(ids)
-        except Exception:
-            pass
+    existing = System.AppDomain.CurrentDomain.GetData(APPDOMAIN_KEY)
+    try:
+        if existing is not None and not existing.IsDisposed:
+            existing.WindowState = WF.FormWindowState.Normal
+            existing.Activate()
+            existing.BringToFront()
+            return
+    except Exception:
+        pass
+    if doc is None:
+        WF.MessageBox.Show('Open a model first.', 'Model Health Check')
+        return
+    handler = _Handler()
+    event = UI.ExternalEvent.Create(handler)
+    form = HealthForm(handler, event)
+    System.AppDomain.CurrentDomain.SetData(APPDOMAIN_KEY, form)
+    try:
+        form.Show(RevitWindow(System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle))
+    except Exception:
+        form.Show()
+    _snapshot()
 
 
 if __name__ == '__main__':
