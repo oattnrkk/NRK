@@ -213,7 +213,7 @@ class Ctx(object):
     def __init__(self, progress=None, cancelled=None):
         self._instances = None
         self._ws_names = {}
-        self.progress = progress or (lambda t: None)
+        self.progress = progress or (lambda t, f=None: None)
         self.cancelled = cancelled or (lambda: False)
         self.workshared = doc.IsWorkshared
 
@@ -440,6 +440,13 @@ def describe(ctx, el):
             extra.append('Level: ' + safe_name(doc.GetElement(lid)))
     except Exception:
         pass
+    try:
+        if is_valid_id(el.GroupId):
+            g = group_of(el)
+            if g is not None:
+                extra.append('In group: ' + group_label(g))
+    except Exception:
+        pass
     return text, ' | '.join(extra)
 
 
@@ -447,8 +454,14 @@ def run_custom(ctx, chk):
     groups = split_groups(chk.filters)
     inc, excl = groups[0], groups[1:]
     ctx.progress('Scanning: ' + chk.name)
+    cands = collect_candidates(inc)
+    total = max(len(cands), 1)
     matches = []
-    for el in collect_candidates(inc):
+    for n, el in enumerate(cands):
+        if n % 1000 == 0:
+            if ctx.cancelled():
+                return Result('SKIP', 'Stopped before finishing')
+            ctx.progress('Scanning: %s  (%d / %d)' % (chk.name, n, len(cands)), float(n) / total)
         try:
             if not eval_group(ctx, el, inc):
                 continue
@@ -662,7 +675,7 @@ def chk_views_hidden(ctx, chk):
     for n, v in enumerate(views):
         if ctx.cancelled():
             break
-        ctx.progress('Hidden elements: view %d / %d' % (n + 1, len(views)))
+        ctx.progress('Hidden elements: view %d / %d' % (n + 1, len(views)), float(n) / max(len(views), 1))
         hidden = 0
         for el in cands:
             try:
@@ -794,7 +807,7 @@ def chk_largest_families(ctx, chk):
     for n, f in enumerate(fams):
         if ctx.cancelled():
             break
-        ctx.progress('Family size %d / %d: %s' % (n + 1, len(fams), f.Name))
+        ctx.progress('Family size %d / %d: %s' % (n + 1, len(fams), f.Name), float(n) / max(len(fams), 1))
         path = os.path.join(tmp, 'mhc_%d.rfa' % n)
         try:
             fd = doc.EditFamily(f)
@@ -841,7 +854,64 @@ CHECK_FUNCS = {
 SLOW_TYPES = ('ViewsWithHiddenElements', 'UnusedElements', 'TenLargestFamilies')
 
 
+def chk_imported_dwg(ctx, chk):
+    """Every non-linked import, with the evidence shown per row so mismatches can be diagnosed."""
+    items = []
+    n_dwg = 0
+    n_other = 0
+    for ii in DB.FilteredElementCollector(doc).OfClass(clr_type(DB.ImportInstance)).ToElements():
+        try:
+            if ii.IsLinked:
+                continue
+        except Exception:
+            pass
+        t = doc.GetElement(ii.GetTypeId())
+        try:
+            cat = ii.Category.Name if ii.Category is not None else ''
+        except Exception:
+            cat = ''
+        names = [safe_name(ii), safe_name(t), cat]
+        is_dwg = 'dwg' in ' '.join(names).lower()          # instance, type or category name; any case
+        if is_dwg:
+            n_dwg += 1
+        else:
+            n_other += 1
+        label = ''
+        for n_ in names:
+            if n_ and 'dwg' in n_.lower():
+                label = n_
+                break
+        label = label or safe_name(t) or safe_name(ii) or cat or '(unnamed import)'
+        info = ['DWG' if is_dwg else 'NOT named dwg (DXF / SKP / other?)', 'Type: ' + safe_name(t), 'Category: ' + cat]
+        try:
+            vid = ii.OwnerViewId
+            if is_valid_id(vid):
+                info.append('2D import in view: ' + safe_name(doc.GetElement(vid)))
+            else:
+                info.append('model (3D) import')
+        except Exception:
+            pass
+        ws = ctx.workset_name(ii)
+        if ws:
+            info.append('Workset: ' + ws)
+        g = group_of(ii)
+        if g is not None:
+            info.append('In group: ' + group_label(g))
+        items.append((label, ii.Id, ' | '.join(info)))
+    items.sort(key=lambda x: x[0])
+    if items:
+        msg = '%s - %d non-linked import(s): %d DWG, %d other format' % (
+            chk.failure_message or 'Imported CAD found', len(items), n_dwg, n_other)
+        return Result(flag_status(chk), msg, items)
+    return Result('PASS', 'No imported CAD files')
+
+
+OVERRIDES = {'Imported DWG file': chk_imported_dwg}
+
+
 def run_check(ctx, chk):
+    if chk.type == 'Custom' and chk.name in OVERRIDES:
+        return OVERRIDES[chk.name](ctx, chk)
     fn = CHECK_FUNCS.get(chk.type)
     if fn is None:
         return Result('SKIP', 'Check type "%s" is not supported by this tool' % chk.type)
@@ -852,7 +922,8 @@ def run_check(ctx, chk):
 # Fixers (the "Fix" buttons)  -  each runs inside one Revit transaction
 # ----------------------------------------------------------------------------
 class Fixer(object):
-    def __init__(self, label, fn, confirm=None, ask=None, plan=None, tip=''):
+    def __init__(self, label, fn, confirm=None, ask=None, plan=None, tip='', group_sensitive=False):
+        self.group_sensitive = group_sensitive   # members of model groups block this fix
         self.label = label
         self.fn = fn              # fn(ids, extra) -> summary text (runs in a transaction)
         self.confirm = confirm    # text with {n}; None = apply without asking
@@ -880,6 +951,91 @@ def short_desc(el):
 
 def add_fail(failures, el, reason):
     failures.append((el.Id, short_desc(el), reason))
+
+
+def group_of(el):
+    """The top-level Group instance that holds el, or None."""
+    try:
+        gid = el.GroupId
+        if not is_valid_id(gid):
+            return None
+        g = doc.GetElement(gid)
+        for _ in range(10):                       # groups can be nested
+            pid = g.GroupId
+            if is_valid_id(pid):
+                g = doc.GetElement(pid)
+            else:
+                break
+        return g
+    except Exception:
+        return None
+
+
+def group_label(g):
+    try:
+        name = g.GroupType.Name
+    except Exception:
+        name = safe_name(g)
+    try:
+        n = len(list(g.GetMemberIds()))
+    except Exception:
+        n = 0
+    return '"%s" (%d member(s))' % (name, n)
+
+
+def ask_ungroup(groups):
+    """groups: {key: [Group, selected_count]} -> 'yes' | 'no' | 'cancel'"""
+    total = sum(v[1] for v in groups.values())
+    lines = ['   %d x in group %s' % (v[1], group_label(v[0])) for v in groups.values()]
+    text = ('%d selected element(s) are inside %d group(s). Revit does not let a script (or you) change '
+            'group members one by one.\r\n\r\n' % (total, len(groups)))
+    text += '\r\n'.join(lines[:10])
+    if len(lines) > 10:
+        text += '\r\n   ... and %d more group(s)' % (len(lines) - 10)
+    text += ('\r\n\r\nYES = ungroup these group instances first, then apply the fix. Only these instances are '
+             'ungrouped; the group type and any other copies of it stay as they are.'
+             '\r\nNO = skip the grouped elements and fix the rest.\r\nCANCEL = stop.')
+    r = WF.MessageBox.Show(text, 'Model Health Check - elements inside groups',
+                           WF.MessageBoxButtons.YesNoCancel, WF.MessageBoxIcon.Question)
+    if r == WF.DialogResult.Yes:
+        return 'yes'
+    if r == WF.DialogResult.No:
+        return 'no'
+    return 'cancel'
+
+
+def ungroup_for(ids):
+    """Ungroup (once each) every group that holds one of ids. Returns (ungrouped, failures, failed_ids)."""
+    failures = []
+    failed = set()
+    tried = set()
+    n = 0
+    for i in ids:
+        for _ in range(10):
+            el = doc.GetElement(i)
+            if el is None:
+                break
+            g = group_of(el)
+            if g is None:
+                break
+            k = eid_val(g.Id)
+            if k in tried:
+                add_fail(failures, el, 'Its group could not be ungrouped (see the first failure for the reason)')
+                failed.add(eid_val(i))
+                break
+            tried.add(k)
+            reason = blockers([g.Id], check_pinned=True).get(k)
+            if not reason:
+                try:
+                    g.UngroupMembers()
+                    n += 1
+                    continue
+                except Exception as ex:
+                    reason = ex_text(ex)
+            add_fail(failures, el, 'Could not ungroup %s: %s' % (group_label(g), reason))
+            failed.add(eid_val(i))
+            break
+    return n, failures, failed
 
 
 def blockers(ids, check_pinned=True, check_group=False):
@@ -914,7 +1070,7 @@ def blockers(ids, check_pinned=True, check_group=False):
             if check_pinned and el.Pinned:
                 out[k] = 'Element is pinned - unpin it first'
             elif check_group and is_valid_id(el.GroupId):
-                out[k] = 'Element is inside a group - edit the group instead'
+                out[k] = 'Element is inside a group - ungroup it first (the Fix button offers to do that for you)'
         except Exception:
             pass
     return out
@@ -1012,7 +1168,7 @@ def delete_ids(ids):
     """Delete elements. Returns (deleted_count, failures); a single failure does not stop the rest."""
     failures = []
     live = [i for i in ids if doc.GetElement(i) is not None]
-    blocked = blockers(live, check_pinned=True)
+    blocked = blockers(live, check_pinned=True, check_group=True)
     todo = []
     for i in live:
         r = blocked.get(eid_val(i))
@@ -1272,7 +1428,7 @@ FIXERS = {
         'Delete imported DWGs', fx_delete,
         confirm='Delete {n} imported DWG instance(s)?\r\n\r\nThis removes the CAD geometry from the model. '
                 'Run "Unused Elements" afterwards and purge to clear the left-over layers and styles. '
-                'You can undo with Ctrl+Z.')],
+                'You can undo with Ctrl+Z.', group_sensitive=True)],
     'Link Model Workset': [Fixer(
         'Move links to *LINKED MODEL_ worksets', fx_link_workset,
         ask=ask_link_plan, plan=plan_link_lines,
@@ -1283,11 +1439,11 @@ FIXERS = {
     'Elements in Link Workset': [Fixer(
         'Move to another workset...', fx_move_workset,
         ask=ask_workset_not_link,
-        confirm='Move {n} element(s) off the link workset?')],
+        confirm='Move {n} element(s) off the link workset?', group_sensitive=True)],
     'WorksetPlacement': [Fixer(
         'Move to another workset...', fx_move_workset,
         ask=ask_workset_not_levels_grids,
-        confirm='Move {n} element(s) off the Levels and Grids workset?')],
+        confirm='Move {n} element(s) off the Levels and Grids workset?', group_sensitive=True)],
     'PinnedLinks': [Fixer('Pin all links', fx_pin)],
     'UnusedElements': [Fixer(
         'Purge unused', fx_delete,
@@ -1325,6 +1481,45 @@ STATUS_COLORS = {
     'ERROR': SD.Color.FromArgb(230, 200, 240),
 }
 ISSUE_STATUSES = ('FAIL', 'WARN', 'ERROR')
+
+
+def score_kind(chk):
+    """Same split Model Checker uses: 'pf' = Pass/Fail check, 'cl' = Count/List check."""
+    if chk.type == 'FileName':
+        return 'pf'
+    if chk.type == 'Custom' and chk.result_condition in ('FailMatchingElements', 'FailNoElements'):
+        return 'pf'
+    return 'cl'
+
+
+def tally_checks(results, checks):
+    t = {'pass': 0, 'fail': 0, 'cl': 0, 'notrun': 0, 'error': 0}
+    for chk in checks:
+        res = results.get(id(chk))
+        if res is None or res.status == 'SKIP':
+            t['notrun'] += 1
+        elif res.status == 'ERROR':
+            t['error'] += 1
+        elif score_kind(chk) == 'cl':
+            t['cl'] += 1
+        elif res.status == 'PASS':
+            t['pass'] += 1
+        else:
+            t['fail'] += 1
+    return t
+
+
+def score_pct(t):
+    """Model Checker score = Pass / (Pass + Fail), rounded; None when nothing pass/fail has run."""
+    d = t['pass'] + t['fail']
+    return int(100.0 * t['pass'] / d + 0.5) if d else None
+
+
+def tally_text(t):
+    txt = '%d Pass, %d Fail, %d Count/List, %d Not Run' % (t['pass'], t['fail'], t['cl'], t['notrun'])
+    if t['error']:
+        txt += ', %d Error' % t['error']
+    return txt
 
 LAST_XML_FILE = os.path.join(os.environ.get('APPDATA', ''), 'pyRevit', 'NRK_ModelHealthCheck_lastxml.txt')
 
@@ -1407,6 +1602,9 @@ class HealthForm(WF.Form):
         self.building = False
         self.model_title = None
         self.fail_notes = {}            # eid -> why the last fix could not change it
+        self.groups = {}                # heading -> ListViewGroup (header shows that group's score)
+        self._run_i = 0                 # progress: checks finished so far
+        self._run_n = 0                 # progress: checks in this run
 
         self.Text = 'Model Health Check'
         self.Width = 1300
@@ -1432,7 +1630,7 @@ class HealthForm(WF.Form):
     def build_top(self):
         self.top = WF.Panel()
         self.top.Dock = WF.DockStyle.Top
-        self.top.Height = 70
+        self.top.Height = 96
         self.top.Padding = WF.Padding(8, 6, 8, 4)
 
         l1 = WF.Label()
@@ -1449,15 +1647,40 @@ class HealthForm(WF.Form):
         self.lbl_model.Text = '-'
         self.top.Controls.Add(self.lbl_model)
 
+        l3 = WF.Label()
+        l3.Text = 'Score:'
+        l3.Left = 8
+        l3.Top = 36
+        l3.AutoSize = True
+        self.top.Controls.Add(l3)
+        self.lbl_score_sum = WF.Label()
+        self.lbl_score_sum.Left = 90
+        self.lbl_score_sum.Top = 36
+        self.lbl_score_sum.AutoSize = True
+        self.lbl_score_sum.Text = 'Run the checks to get the score'
+        self.top.Controls.Add(self.lbl_score_sum)
+
+        self.lbl_score = WF.Label()          # the big number, like Model Checker's "45%"
+        self.lbl_score.Left = 1080
+        self.lbl_score.Top = 2
+        self.lbl_score.Width = 190
+        self.lbl_score.Height = 54
+        self.lbl_score.TextAlign = SD.ContentAlignment.MiddleRight
+        self.lbl_score.Font = SD.Font('Segoe UI', 28.0, SD.FontStyle.Bold)
+        self.lbl_score.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
+        self.lbl_score.ForeColor = SD.Color.Gray
+        self.lbl_score.Text = '--'
+        self.top.Controls.Add(self.lbl_score)
+
         l2 = WF.Label()
         l2.Text = 'Check set XML:'
         l2.Left = 8
-        l2.Top = 41
+        l2.Top = 68
         l2.AutoSize = True
         self.top.Controls.Add(l2)
         self.txt_xml = WF.TextBox()
         self.txt_xml.Left = 90
-        self.txt_xml.Top = 38
+        self.txt_xml.Top = 65
         self.txt_xml.Width = 960
         self.txt_xml.ReadOnly = True
         self.txt_xml.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Left | WF.AnchorStyles.Right
@@ -1465,7 +1688,7 @@ class HealthForm(WF.Form):
         b = WF.Button()
         b.Text = 'Browse...'
         b.Left = 1060
-        b.Top = 36
+        b.Top = 63
         b.Width = 80
         b.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
         b.Click += self.on_browse
@@ -1473,7 +1696,7 @@ class HealthForm(WF.Form):
         b2 = WF.Button()
         b2.Text = 'Reload'
         b2.Left = 1146
-        b2.Top = 36
+        b2.Top = 63
         b2.Width = 70
         b2.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
         b2.Click += lambda s, e: self.load_checks()
@@ -1604,11 +1827,20 @@ class HealthForm(WF.Form):
         self.pb.Top = 8
         self.pb.Width = 220
         self.pb.Height = 18
+        self.pb.Minimum = 0
+        self.pb.Maximum = 100
         self.status.Controls.Add(self.pb)
-        self.btn_stop = self.make_button(self.status, 'Stop', 236, 4, self.on_stop, 60)
+        self.lbl_pct = WF.Label()
+        self.lbl_pct.Left = 234
+        self.lbl_pct.Top = 8
+        self.lbl_pct.Width = 46
+        self.lbl_pct.Font = SD.Font('Segoe UI', 9.0, SD.FontStyle.Bold)
+        self.lbl_pct.Text = '0%'
+        self.status.Controls.Add(self.lbl_pct)
+        self.btn_stop = self.make_button(self.status, 'Stop', 284, 4, self.on_stop, 60)
         self.btn_stop.Enabled = False
         self.lbl_sum = WF.Label()
-        self.lbl_sum.Left = 308
+        self.lbl_sum.Left = 356
         self.lbl_sum.Top = 9
         self.lbl_sum.AutoSize = True
         self.lbl_sum.Text = 'Ready'
@@ -1718,7 +1950,7 @@ class HealthForm(WF.Form):
             if issues_only and res is not None and res.status not in ISSUE_STATUSES:
                 continue
             if chk.heading not in groups:
-                g = WF.ListViewGroup(chk.heading, chk.heading)
+                g = WF.ListViewGroup(chk.heading, self.group_header(chk.heading))
                 self.lv.Groups.Add(g)
                 groups[chk.heading] = g
             label = chk.name + ('  (slow)' if chk.type in SLOW_TYPES else '')
@@ -1736,7 +1968,36 @@ class HealthForm(WF.Form):
             if chk is keep:
                 it.Selected = True
         self.lv.EndUpdate()
+        self.groups = groups
         self.building = False
+        self.update_scores()
+
+    def group_header(self, heading):
+        t = tally_checks(self.results, [c for c in self.checks if c.heading == heading])
+        p = score_pct(t)
+        return '%s     %s%s' % (heading, ('%d%%   -   ' % p) if p is not None else '', tally_text(t))
+
+    def update_scores(self):
+        """Overall score (big number) and the per-priority headers, same maths as Model Checker."""
+        t = tally_checks(self.results, self.checks)
+        p = score_pct(t)
+        if p is None:
+            self.lbl_score.Text = '--'
+            self.lbl_score.ForeColor = SD.Color.Gray
+            self.lbl_score_sum.Text = '%d checks  |  %s' % (len(self.checks), tally_text(t))
+        else:
+            self.lbl_score.Text = '%d%%' % p
+            self.lbl_score.ForeColor = (SD.Color.FromArgb(200, 40, 40) if p < 50 else
+                                        SD.Color.FromArgb(220, 130, 0) if p < 80 else
+                                        SD.Color.FromArgb(40, 150, 60))
+            self.lbl_score_sum.Text = '%d checks  |  %d Pass (%d%%)  |  %d Fail  |  %d Count/List  |  %d Not Run%s' % (
+                len(self.checks), t['pass'], p, t['fail'], t['cl'], t['notrun'],
+                ('  |  %d Error' % t['error']) if t['error'] else '')
+        for h, g in self.groups.items():
+            try:
+                g.Header = self.group_header(h)
+            except Exception:
+                pass
 
     def on_item_checked(self, s, e):
         if not self.building and e.Item.Tag is not None:
@@ -1784,7 +2045,13 @@ class HealthForm(WF.Form):
         if state:
             self.cancel = False
 
-    def set_progress(self, text):
+    def set_progress(self, text, frac=None):
+        """Overall % = (checks finished + fraction of the current one) / checks in this run."""
+        if self._run_n:
+            pos = self._run_i + (frac if frac is not None else 0.0)
+            pct = max(0, min(100, int(100.0 * pos / self._run_n)))
+            self.pb.Value = pct
+            self.lbl_pct.Text = '%d%%' % pct
         self.lbl_sum.Text = text
         WF.Application.DoEvents()
 
@@ -1792,8 +2059,10 @@ class HealthForm(WF.Form):
         self.sync_model()
         t0 = time.time()
         ctx = Ctx(progress=self.set_progress, cancelled=lambda: self.cancel)
-        self.pb.Maximum = max(len(chks), 1)
+        self._run_n = len(chks)
+        self._run_i = 0
         self.pb.Value = 0
+        self.lbl_pct.Text = '0%'
         done = 0
         for chk in chks:
             if self.cancel:
@@ -1812,9 +2081,13 @@ class HealthForm(WF.Form):
                 row.SubItems[3].Text = str(res.count) if res.count else ''
                 row.BackColor = STATUS_COLORS.get(res.status, SD.Color.White)
             done += 1
-            self.pb.Value = done
-            WF.Application.DoEvents()
+            self._run_i = done
+            self.set_progress('Finished: ' + chk.name)
+        if not self.cancel:
+            self.set_progress('Done')
+        self._run_n = 0
         self.set_busy(False)
+        self.update_scores()
         self.update_summary(time.time() - t0)
         if self.chk_issues.Checked:
             self.refresh_list()
@@ -1943,8 +2216,25 @@ class HealthForm(WF.Form):
                 extra = fixer.ask(live)
                 if extra is None:
                     return
+            ungroup_yes = False
+            if fixer.group_sensitive:
+                groups = {}
+                for i in live:
+                    g = group_of(doc.GetElement(i))
+                    if g is not None:
+                        k = eid_val(g.Id)
+                        if k not in groups:
+                            groups[k] = [g, 0]
+                        groups[k][1] += 1
+                if groups:
+                    ans = ask_ungroup(groups)
+                    if ans == 'cancel':
+                        return
+                    ungroup_yes = (ans == 'yes')
             if fixer.confirm:
                 text = fixer.confirm.replace('{n}', str(len(live)))
+                if ungroup_yes:
+                    text += '\r\n\r\nThe groups listed earlier will be ungrouped first.'
                 if fixer.plan is not None:
                     lines = fixer.plan(live, extra)
                     text += '\r\n\r\n' + '\r\n'.join(lines[:15])
@@ -1963,7 +2253,21 @@ class HealthForm(WF.Form):
             failures = []
             summary = ''
             try:
-                summary, failures = fixer.fn(live, extra)
+                todo = live
+                n_ungrouped = 0
+                pre_failures = []
+                if ungroup_yes:
+                    self.set_progress('Ungrouping...')
+                    n_ungrouped, pre_failures, failed_ids = ungroup_for(live)
+                    todo = [i for i in live if eid_val(i) not in failed_ids]
+                self.set_progress('Applying fix: ' + fixer.label)
+                if todo:
+                    summary, failures = fixer.fn(todo, extra)
+                else:
+                    summary, failures = 'Nothing left to change', []
+                failures = pre_failures + failures
+                if n_ungrouped:
+                    summary = '%d group(s) ungrouped. %s' % (n_ungrouped, summary)
                 status = t.Commit()
             except Exception:
                 t.RollBack()
