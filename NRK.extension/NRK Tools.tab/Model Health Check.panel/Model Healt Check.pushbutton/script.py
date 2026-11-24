@@ -68,6 +68,141 @@ _guard, _snapshot = _make_guard()
 MAX_ROWS = 5000
 FT_TO_MM = 304.8
 
+SETTINGS = {}      # last-used settings, loaded from / saved to a json file (see load_settings)
+SETTINGS_FILE = os.path.join(os.environ.get('APPDATA', ''), 'pyRevit', 'NRK_ModelHealthCheck_settings.json')
+
+
+def data_dir():
+    """Folder for the fix log and the score history."""
+    d = SETTINGS.get('data_dir') or os.path.join(os.path.expanduser('~'), 'Documents', 'NRK Model Health Check')
+    try:
+        if not os.path.exists(d):
+            os.makedirs(d)
+    except Exception:
+        pass
+    return d
+
+
+def file_safe(name):
+    return re.sub(r'[^\w\-]+', '_', os.path.splitext(name or 'model')[0])
+
+
+def parse_csv_line(line):
+    out = []
+    cur = []
+    q = False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            if c == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    cur.append('"')
+                    i += 1
+                else:
+                    q = False
+            else:
+                cur.append(c)
+        elif c == '"':
+            q = True
+        elif c == ',':
+            out.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    out.append(''.join(cur))
+    return out
+
+
+FIX_CHANGES = []       # (action, ElementId, description, detail) - filled by the fixers, written to the fix log
+
+
+def append_text(path, text):
+    System.IO.File.AppendAllText(path, text, System.Text.UTF8Encoding(True))
+
+
+def write_fix_log(model, check_name, fixer_label, summary, changes, failures):
+    """One CSV per model; every fix appends rows (what changed, what was skipped and why)."""
+    try:
+        path = os.path.join(data_dir(), 'FixLog_%s.csv' % file_safe(model))
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        user = System.Environment.UserName
+        rows = []
+        if not os.path.exists(path):
+            rows.append(('Timestamp', 'User', 'Model', 'Check', 'Fix', 'Result', 'Action', 'ElementId', 'Element', 'Detail', 'Reason'))
+        base = (stamp, user, model or '', check_name, fixer_label)
+        rows.append(base + ('SUMMARY', '', '', '', summary.replace('\r\n', ' | '), ''))
+        for action, eid, desc, detail in changes:
+            rows.append(base + ('OK', action, eid_val(eid) if eid is not None else '', desc, detail, ''))
+        for eid, desc, reason in failures:
+            rows.append(base + ('FAILED', '', eid_val(eid) if eid is not None else '', desc, '', reason))
+        append_text(path, '\r\n'.join(','.join(csv_cell(x) for x in r) for r in rows) + '\r\n')
+        return path
+    except Exception:
+        return None
+
+
+def history_path():
+    return os.path.join(data_dir(), 'ScoreHistory.csv')
+
+
+def append_history(model, t, p):
+    try:
+        path = history_path()
+        rows = []
+        if not os.path.exists(path):
+            rows.append(('Timestamp', 'Model', 'Score', 'Pass', 'Fail', 'CountList', 'NotRun'))
+        rows.append((time.strftime('%Y-%m-%d %H:%M:%S'), model or '', p, t['pass'], t['fail'], t['cl'], t['notrun']))
+        append_text(path, '\r\n'.join(','.join(csv_cell(x) for x in r) for r in rows) + '\r\n')
+    except Exception:
+        pass
+
+
+def read_history(model):
+    """[(timestamp, score, pass, fail, cl, notrun)] for one model, oldest first."""
+    out = []
+    try:
+        path = history_path()
+        if os.path.exists(path):
+            for line in System.IO.File.ReadAllText(path).splitlines():
+                f = parse_csv_line(line)
+                if len(f) >= 7 and f[1] == (model or '') and f[2].isdigit():
+                    out.append((f[0], int(f[2]), int(f[3]), int(f[4]), int(f[5]), int(f[6])))
+    except Exception:
+        pass
+    return out
+
+
+def ws_name_of(el):
+    try:
+        return doc.GetWorksetTable().GetWorkset(el.WorksetId).Name
+    except Exception:
+        return ''
+
+
+def load_settings():
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            import json
+            d = json.loads(open(SETTINGS_FILE).read())
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def save_settings(d):
+    try:
+        import json
+        folder = os.path.dirname(SETTINGS_FILE)
+        if folder and not os.path.exists(folder):
+            os.makedirs(folder)
+        open(SETTINGS_FILE, 'w').write(json.dumps(d, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
 
 # ----------------------------------------------------------------------------
 # small helpers
@@ -139,6 +274,8 @@ class CheckDef(object):
         self.description = ''
         self.filters = []       # list of dict
         self.options = {}       # PrebuiltOptions attributes
+        self.xml_checked = True  # tick state written in the XML
+        self.extra = False       # True = added by this tool, not in the XML (left out of the score)
 
 
 def parse_checkset(path):
@@ -158,6 +295,7 @@ def parse_checkset(path):
                 d.result_condition = c.get('ResultCondition') or 'FailMatchingElements'
                 d.required = truthy(c.get('IsRequired', 'True'))
                 d.checked = truthy(c.get('IsChecked', 'True'))
+                d.xml_checked = d.checked
                 d.failure_message = c.get('FailureMessage') or ''
                 d.description = c.get('Description') or ''
                 for f in c.findall('Filter'):
@@ -196,6 +334,7 @@ class Result(object):
         self.status = status          # PASS FAIL WARN INFO SKIP ERROR
         self.message = message
         self.items = items or []      # tuples: (text, ElementId or None, extra)
+        self.groups = None            # optional: [(label, [ElementId], extra)] one row per family
 
     @property
     def count(self):
@@ -294,6 +433,8 @@ def family_of(el):
         return el.Symbol.Family
     if isinstance(el, DB.FamilySymbol):
         return el.Family
+    if isinstance(el, DB.Family):
+        return el
     return None
 
 
@@ -450,7 +591,18 @@ def describe(ctx, el):
     return text, ' | '.join(extra)
 
 
-def run_custom(ctx, chk):
+def _not_system_family(ctx, el):
+    """System families (walls, floors, ducts...) have no family file, so their family name cannot be
+    renamed. They are left out of the naming check unless the option is switched off."""
+    if not SETTINGS.get('skip_system_families', True):
+        return True
+    return family_of(el) is not None
+
+
+POST_FILTERS = {'Family Naming Convention': _not_system_family}
+
+
+def _run_custom_core(ctx, chk):
     groups = split_groups(chk.filters)
     inc, excl = groups[0], groups[1:]
     ctx.progress('Scanning: ' + chk.name)
@@ -467,14 +619,39 @@ def run_custom(ctx, chk):
                 continue
             if any(eval_group(ctx, el, g) for g in excl):
                 continue
+            post = POST_FILTERS.get(chk.name)
+            if post is not None and not post(ctx, el):
+                continue
             matches.append(el)
         except Exception:
             continue
     items = []
+    gmap = {}
+    gorder = []
     for el in matches:
         text, extra = describe(ctx, el)
         items.append((text, el.Id, extra))
+        fam = family_of(el)
+        if fam is not None:
+            try:
+                cat = el.Category.Name if el.Category is not None else ''
+            except Exception:
+                cat = ''
+            key = ('f', eid_val(fam.Id))
+            label = '%s | %s' % (cat, fam.Name)
+        else:
+            key = ('e', eid_val(el.Id))
+            label = text
+        g = gmap.get(key)
+        if g is None:
+            gmap[key] = [label, [el.Id], extra]
+            gorder.append(key)
+        else:
+            g[1].append(el.Id)
     items.sort(key=lambda x: x[0])
+    ctx.last_groups = None
+    if len(gmap) < len(items):                 # something to collapse: many instances of one family
+        ctx.last_groups = sorted([tuple(gmap[k]) for k in gorder], key=lambda x: x[0])
     rc = chk.result_condition
     if rc == 'CountAndList':
         return Result('INFO', '%d element(s)' % len(items), items)
@@ -486,6 +663,13 @@ def run_custom(ctx, chk):
     if items:
         return Result(flag_status(chk), chk.failure_message or '%d element(s) found' % len(items), items)
     return Result('PASS', 'No issues found', [])
+
+
+def run_custom(ctx, chk):
+    ctx.last_groups = None
+    res = _run_custom_core(ctx, chk)
+    res.groups = ctx.last_groups
+    return res
 
 
 # ----------------------------------------------------------------------------
@@ -922,7 +1106,8 @@ def run_check(ctx, chk):
 # Fixers (the "Fix" buttons)  -  each runs inside one Revit transaction
 # ----------------------------------------------------------------------------
 class Fixer(object):
-    def __init__(self, label, fn, confirm=None, ask=None, plan=None, tip='', group_sensitive=False):
+    def __init__(self, label, fn, confirm=None, ask=None, plan=None, tip='', group_sensitive=False, destructive=False):
+        self.destructive = destructive           # deletes things: locked unless 'Allow delete fixes' is ticked
         self.group_sensitive = group_sensitive   # members of model groups block this fix
         self.label = label
         self.fn = fn              # fn(ids, extra) -> summary text (runs in a transaction)
@@ -1027,8 +1212,10 @@ def ungroup_for(ids):
             reason = blockers([g.Id], check_pinned=True).get(k)
             if not reason:
                 try:
+                    glabel = group_label(g)
                     g.UngroupMembers()
                     n += 1
+                    FIX_CHANGES.append(('ungrouped', g.Id, glabel, ''))
                     continue
                 except Exception as ex:
                     reason = ex_text(ex)
@@ -1178,11 +1365,15 @@ def delete_ids(ids):
             todo.append(i)
     if not todo:
         return 0, failures
+    descs = dict((eid_val(i), short_desc(doc.GetElement(i))) for i in todo)
     col = List[DB.ElementId]()
     for i in todo:
         col.Add(i)
     try:
-        return len(doc.Delete(col)), failures
+        n_deleted = len(doc.Delete(col))
+        for i in todo:
+            FIX_CHANGES.append(('deleted', i, descs[eid_val(i)], ''))
+        return n_deleted, failures
     except Exception:
         done = 0
         for i in todo:
@@ -1195,6 +1386,7 @@ def delete_ids(ids):
                 doc.Delete(i)
                 st.Commit()
                 done += 1
+                FIX_CHANGES.append(('deleted', i, descs.get(eid_val(i), ''), ''))
             except Exception as ex:
                 st.RollBack()
                 add_fail(failures, el, 'Revit refused to delete it: ' + ex_text(ex))
@@ -1221,6 +1413,7 @@ def fx_pin(ids, extra):
         try:
             el.Pinned = True
             done += 1
+            FIX_CHANGES.append(('pinned', i, short_desc(el), ''))
         except Exception as ex:
             add_fail(failures, el, ex_text(ex))
     return '%d link(s) pinned, %d skipped' % (done, len(failures)), failures
@@ -1239,6 +1432,7 @@ def fx_overlay(ids, extra):
                 continue
             lt.AttachmentType = DB.AttachmentType.Overlay
             done += 1
+            FIX_CHANGES.append(('set to Overlay', i, short_desc(lt), ''))
         except Exception as ex:
             add_fail(failures, lt, ex_text(ex))
     return '%d link type(s) set to Overlay, %d skipped' % (done, len(failures)), failures
@@ -1291,6 +1485,10 @@ def choose_workset(prompt, exclude):
     for w in cands:
         cb.Items.Add(w.Name)
     cb.SelectedIndex = 0
+    for idx, w in enumerate(cands):                       # remember the last choice
+        if w.Name == SETTINGS.get('last_workset'):
+            cb.SelectedIndex = idx
+            break
     f.Controls.Add(cb)
     ok = WF.Button()
     ok.Text = 'OK'
@@ -1307,6 +1505,7 @@ def choose_workset(prompt, exclude):
     f.AcceptButton = ok
     f.CancelButton = no
     if f.ShowDialog() == WF.DialogResult.OK:
+        SETTINGS['last_workset'] = cands[cb.SelectedIndex].Name
         return cands[cb.SelectedIndex]
     return None
 
@@ -1331,11 +1530,13 @@ def fx_move_workset(ids, ws):
         el = doc.GetElement(i)
         if el is None:
             continue
+        old = ws_name_of(el)
         r = blocked.get(eid_val(i)) or set_workset(el, ws)
         if r:
             add_fail(failures, el, r)
         else:
             done += 1
+            FIX_CHANGES.append(('moved workset', i, short_desc(el), '"%s" -> "%s"' % (old, ws.Name)))
     return '%d element(s) moved to "%s", %d skipped' % (done, ws.Name, len(failures)), failures
 
 
@@ -1415,20 +1616,256 @@ def fx_link_workset(ids, plan):
         except Exception as ex:
             add_fail(failures, li, 'Could not create workset "%s": %s' % (target, ex_text(ex)))
             continue
+        old = ws_name_of(li)
         r = set_workset(li, ws)
         if r:
             add_fail(failures, li, r)
         else:
             done += 1
+            FIX_CHANGES.append(('moved workset', i, short_desc(li), '"%s" -> "%s"' % (old, ws.Name)))
     return '%d link(s) moved, %d new workset(s) created, %d skipped' % (done, len(created), len(failures)), failures
 
 
+# ---- Family Naming Convention (VDCREF - Revit Family Naming v2) --------------------------
+# Family name = [Family Prefix]-[Element]-[Unique Identifier]-[OneGDC Acronym]-[Manufacturer]
+# The prefix depends on the Revit category (g-DOR for Doors ...). Only the prefix can be automated.
+FAMILY_PREFIX_ROWS = [
+    ('Air Terminals', 'g-AIR'),
+    ('Generic Annotations', 'g-ANO'),
+    ('Cable Trays', 'g-CBT'),
+    ('Cable Tray Fittings', 'g-CTF'),
+    ('Casework', 'g-CSW'),
+    ('Ceilings', 'g-CLG'),
+    ('Columns', 'g-COL'),
+    ('Communication Devices', 'g-COM'),
+    ('Curtain Panels', 'g-CTP'),
+    ('Curtain System', 'g-CTS'),
+    ('Curtain Wall Mullions', 'g-CTM'),
+    ('Data Devices', 'g-DAT'),
+    ('Detail Items', 'g-DET'),
+    ('Doors', 'g-DOR'),
+    ('Duct Accessories', 'g-DCA'),
+    ('Duct Fittings', 'g-DCF'),
+    ('Duct Insulations', 'g-DCI'),
+    ('Duct Linings', 'g-DCL'),
+    ('Ducts', 'g-DCT'),
+    ('Electrical Equipment', 'g-ELE'),
+    ('Electrical Fixtures', 'g-ELF'),
+    ('Entourage', 'g-ENT'),
+    ('Fire Alarm Devices', 'g-FIR'),
+    ('Flex Ducts', 'g-FXD'),
+    ('Flex Pipes', 'g-FXP'),
+    ('Floors', 'g-FLR'),
+    ('Furniture', 'g-FRN'),
+    ('Furniture Systems', 'g-FRS'),
+    ('Generic Models', 'g-GNM'),
+    ('Lighting Devices', 'g-LGD'),
+    ('Lighting Fixtures', 'g-LGF'),
+    ('Mass', 'g-MAS'),
+    ('Mechanical Equipment', 'g-MEC'),
+    ('Nurse Call Devices', 'g-NRS'),
+    ('Parking', 'g-PRK'),
+    ('Pipe Accessories', 'g-PPA'),
+    ('Pipe Fittings', 'g-PPF'),
+    ('Pipes', 'g-PPS'),
+    ('Planting', 'g-PLN'),
+    ('Plumbing Fixtures', 'g-PLM'),
+    ('Railings', 'g-RLG'),
+    ('Ramps', 'g-RMP'),
+    ('Roads', 'g-RDS'),
+    ('Roofs', 'g-ROF'),
+    ('Security Devices', 'g-SEC'),
+    ('Shaft Openings', 'g-SFT'),
+    ('Site', 'g-SIT'),
+    ('Specialty Equipment', 'g-SPC'),
+    ('Sprinklers', 'g-SPK'),
+    ('Stairs', 'g-STA'),
+    ('Structural Area Reinforcement', 'g-SAR'),
+    ('Structural Beam System', 'g-SBS'),
+    ('Structural Columns', 'g-SCL'),
+    ('Structural Connections', 'g-SCO'),
+    ('Structural Foundations', 'g-SFO'),
+    ('Structural Framing', 'g-SFA'),
+    ('Structural Load Cases', 'g-SLC'),
+    ('Structural Path Reinforcement', 'g-SPR'),
+    ('Structural Rebar', 'g-SRB'),
+    ('Structural Stiffeners', 'g-SSF'),
+    ('Structural Trusses', 'g-STR'),
+    ('Telephone Devices', 'g-TEL'),
+    ('Title Blocks', 'g-TTB'),
+    ('Topography', 'g-TOP'),
+    ('Walls', 'g-WLL'),
+    ('Windows', 'g-WDW'),
+    ('Wires', 'g-WIR'),
+]
+
+FIX_EXTRA_NOTES = {}      # eid -> reason; lets a fixer annotate rows other than the one it reports
+
+
+def _norm_cat(n):
+    k = re.sub(r'[^a-z]', '', (n or '').lower())
+    return k[:-1] if k.endswith('s') else k        # Doors / Door, Pipe Fittings / Pipe Fitting ...
+
+
+def load_prefix_table():
+    """Built-in table, overridden by family_prefixes.csv next to this script (if present)."""
+    table = {}
+    for c, p in FAMILY_PREFIX_ROWS:
+        table[_norm_cat(c)] = p
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'family_prefixes.csv')
+        if os.path.exists(path):
+            for line in open(path).read().splitlines():
+                line = line.strip()
+                if not line or line.startswith('#') or ',' not in line:
+                    continue
+                c, p = [x.strip().strip('"') for x in line.rsplit(',', 1)]
+                if c.lower() != 'category' and p:
+                    table[_norm_cat(c)] = p
+    except Exception:
+        pass
+    return table
+
+
+def build_family_name(prefix, old):
+    """Put the category prefix in front of the existing name (the rest cannot be guessed)."""
+    name = re.sub(r'[!,@#$%^&*()]', '', old or '')                     # sheet: avoid special characters
+    m = re.match(r'(?i)^g[-_ ]?[a-z]{3}(?=[-_ ])[-_ ]*', name)          # an old / ill-formed g-XXX prefix
+    if m:
+        name = name[m.end():]
+    name = re.sub(r'\s+', ' ', name).strip(' -_')
+    return '%s-%s' % (prefix, name) if name else prefix
+
+
+def ask_family_plan(ids):
+    """Read-only: one entry per family (renaming a family fixes all of its instances)."""
+    table = load_prefix_table()
+    entries = {}
+    order = []
+    for i in ids:
+        el = doc.GetElement(i)
+        if el is None:
+            continue
+        fam = family_of(el)
+        if fam is not None:
+            key = ('f', eid_val(fam.Id))
+        else:
+            key = ('s', param_text(el, 'ELEM_FAMILY_PARAM') or safe_name(el))
+        e = entries.get(key)
+        if e is None:
+            if fam is not None:
+                try:
+                    cat = fam.FamilyCategory.Name
+                except Exception:
+                    cat = ''
+                pre = table.get(_norm_cat(cat))
+                e = {'fam': fam, 'old': fam.Name, 'cat': cat, 'new': None, 'problem': None, 'ids': []}
+                if pre is None:
+                    e['problem'] = 'No prefix for category "%s" in the naming sheet - add a line to family_prefixes.csv' % cat
+                else:
+                    e['new'] = build_family_name(pre, fam.Name)
+            else:
+                e = {'fam': None, 'old': key[1], 'cat': '', 'new': None, 'ids': [],
+                     'problem': 'System family - its family name cannot be renamed; rename or duplicate its types instead'}
+            entries[key] = e
+            order.append(key)
+        e['ids'].append(i)
+    return [entries[k] for k in order]
+
+
+def plan_family_lines(ids, plan):
+    out = []
+    for e in sorted(plan, key=lambda x: (x['problem'] is not None, x['old'])):
+        if e['problem']:
+            out.append('%s   -> SKIPPED: %s' % (e['old'], e['problem']))
+        else:
+            out.append('%s  ->  %s   (%d instance(s))' % (e['old'], e['new'], len(e['ids'])))
+    return out
+
+
+def _entry_fail(failures, e, reason):
+    failures.append((e['ids'][0], 'Family "%s"  (%d instance(s))' % (e['old'], len(e['ids'])), reason))
+    for i in e['ids']:
+        FIX_EXTRA_NOTES[eid_val(i)] = reason
+
+
+def fx_family_prefix(ids, plan):
+    failures = []
+    renamed = 0
+    affected = 0
+    existing = set()
+    for f in DB.FilteredElementCollector(doc).OfClass(clr_type(DB.Family)).ToElements():
+        existing.add(safe_name(f).lower())
+    for e in plan:
+        if e['problem']:
+            _entry_fail(failures, e, e['problem'])
+            continue
+        fam = e['fam']
+        new = e['new']
+        if new == e['old']:
+            continue
+        if new.lower() in existing and new.lower() != e['old'].lower():
+            _entry_fail(failures, e, 'A family named "%s" already exists - rename one of them by hand' % new)
+            continue
+        r = blockers([fam.Id], check_pinned=False).get(eid_val(fam.Id))
+        if r:
+            _entry_fail(failures, e, r)
+            continue
+        try:
+            fam.Name = new
+            FIX_CHANGES.append(('renamed family', fam.Id, e['old'], '%s -> %s  (%d instance(s))' % (e['old'], new, len(e['ids']))))
+            existing.discard(e['old'].lower())
+            existing.add(new.lower())
+            renamed += 1
+            affected += len(e['ids'])
+        except Exception as ex:
+            _entry_fail(failures, e, 'Revit refused the rename: ' + ex_text(ex))
+    return '%d family(ies) renamed (%d instance(s) affected), %d skipped' % (renamed, affected, len(failures)), failures
+
+
+REVIEW_WORKSET = 'ZZ_UNHOSTED_REVIEW'
+
+
+def ask_review_workset(ids):
+    if not doc.IsWorkshared:
+        WF.MessageBox.Show('This model is not workshared, so there is no workset to move them to.', 'Model Health Check')
+        return None
+    return REVIEW_WORKSET
+
+
+def fx_move_review(ids, name):
+    """Park the elements on a review workset instead of deleting them."""
+    ws = None
+    for w in user_worksets():
+        if w.Name == name:
+            ws = w
+            break
+    if ws is None:
+        try:
+            ws = DB.Workset.Create(doc, name)
+        except Exception as ex:
+            failures = []
+            for i in ids:
+                el = doc.GetElement(i)
+                if el is not None:
+                    add_fail(failures, el, 'Could not create workset "%s": %s' % (name, ex_text(ex)))
+            return '0 element(s) moved', failures
+    return fx_move_workset(ids, ws)
+
+
+_REVIEW_CONFIRM = ('Move {n} element(s) to the workset "' + REVIEW_WORKSET + '" (created if missing) so they can be reviewed?\r\n\r\n'
+                   'Nothing is deleted. Filter that workset in the Worksets dialog or in a view to find them again.')
+
 FIXERS = {
+    'Unhosted Family': [Fixer('Move to review workset (no delete)', fx_move_review, ask=ask_review_workset,
+                              confirm=_REVIEW_CONFIRM, group_sensitive=True)],
+    'Unhosted Interface Points': [Fixer('Move to review workset (no delete)', fx_move_review, ask=ask_review_workset,
+                                        confirm=_REVIEW_CONFIRM, group_sensitive=True)],
     'Imported DWG file': [Fixer(
         'Delete imported DWGs', fx_delete,
         confirm='Delete {n} imported DWG instance(s)?\r\n\r\nThis removes the CAD geometry from the model. '
                 'Run "Unused Elements" afterwards and purge to clear the left-over layers and styles. '
-                'You can undo with Ctrl+Z.', group_sensitive=True)],
+                'You can undo with Ctrl+Z.', group_sensitive=True, destructive=True)],
     'Link Model Workset': [Fixer(
         'Move links to *LINKED MODEL_ worksets', fx_link_workset,
         ask=ask_link_plan, plan=plan_link_lines,
@@ -1444,22 +1881,78 @@ FIXERS = {
         'Move to another workset...', fx_move_workset,
         ask=ask_workset_not_levels_grids,
         confirm='Move {n} element(s) off the Levels and Grids workset?', group_sensitive=True)],
+    'PrefixMatchesCategory': [Fixer(
+        'Correct the prefix', fx_family_prefix,
+        ask=ask_family_plan, plan=plan_family_lines,
+        confirm='Replace the prefix of these families with the one of their category? ({n} selected)\r\n\r\n'
+                'Only the g-XXX part changes; the rest of the name is kept. Ctrl+Z undoes this.')],
+    'Family Naming Convention': [Fixer(
+        'Add category prefix (g-XXX-)', fx_family_prefix,
+        ask=ask_family_plan, plan=plan_family_lines,
+        confirm='Rename the families below so they start with the prefix of their category? '
+                '({n} element(s) selected; each family is renamed once.)\r\n\r\n'
+                'The sheet also wants [Element]-[Unique Identifier]-[OneGDC Acronym]-[Manufacturer] after the prefix. '
+                'Those parts cannot be guessed, so the existing name is kept after the prefix. Ctrl+Z undoes this.')],
     'PinnedLinks': [Fixer('Pin all links', fx_pin)],
     'UnusedElements': [Fixer(
         'Purge unused', fx_delete,
         confirm='Delete {n} unused element(s) (similar to Manage > Purge Unused)?\r\n\r\n'
-                'You can undo with Ctrl+Z.')],
+                'You can undo with Ctrl+Z.', destructive=True)],
 }
 
 # Manual guidance (from the Model QC guide) for checks that cannot be fixed safely by a script
 HINTS = {
+    'Unhosted Interface Points': u'Interface Point ที่ไม่มี Host: ห้ามลบ ปุ่ม Fix จะย้ายไป Workset ZZ_UNHOSTED_REVIEW เพื่อแยกตรวจเท่านั้น ไม่ลบอะไรทั้งสิ้น',
+    'Family Prefix matches Category': u'Prefix g-XXX ของชื่อ Family ต้องตรงกับ Category ตามตารางในไฟล์ Excel เช่น ประตูต้องเป็น g-DOR ปุ่ม Fix จะเปลี่ยนเฉพาะส่วน g-XXX เช็คนี้เป็นเช็คเสริมของเครื่องมือ ไม่อยู่ใน XML และไม่นับในคะแนน',
+    'Family Naming Convention': u'ชื่อ Family ต้องขึ้นต้นด้วย Prefix ตาม Category ของ Revit เช่น g-DOR-... (Doors), g-MEC-... (Mechanical Equipment) รูปแบบ [Prefix]-[Element]-[Unique Identifier]-[OneGDC Acronym]-[Manufacturer] ปุ่ม Fix จะเติม Prefix ให้ตาม Category ส่วน Element / Identifier / Acronym / Manufacturer ต้องตั้งเอง และห้ามใช้อักขระพิเศษ ! , @ # $ % ^ & * ( ) Category ที่ไม่มีในตาราง Prefix จะเปลี่ยนชื่อ Family อัตโนมัติไม่ได้ ส่วน System Family (Wall, Floor, Duct ฯลฯ) ไม่ถูกนับเป็น FAIL เพราะเปลี่ยนชื่อ Family ไม่ได้ (ปิดได้ที่ช่อง Skip system families)',
     'Generic Models': u'\u0e41\u0e01\u0e49\u0e40\u0e2d\u0e07: \u0e40\u0e1b\u0e34\u0e14 Family (Edit Family) \u0e41\u0e25\u0e49\u0e27\u0e40\u0e1b\u0e25\u0e35\u0e48\u0e22\u0e19 Category \u0e43\u0e2b\u0e49\u0e15\u0e23\u0e07\u0e0a\u0e19\u0e34\u0e14\u0e27\u0e31\u0e15\u0e16\u0e38 \u0e40\u0e0a\u0e48\u0e19 Mechanical Equipment / Electrical Fixtures \u0e16\u0e49\u0e32\u0e41\u0e01\u0e49\u0e44\u0e21\u0e48\u0e44\u0e14\u0e49\u0e43\u0e2b\u0e49\u0e2a\u0e23\u0e49\u0e32\u0e07 Family \u0e43\u0e2b\u0e21\u0e48\u0e41\u0e25\u0e49\u0e27\u0e27\u0e32\u0e07\u0e17\u0e31\u0e1a\u0e41\u0e17\u0e19 (\u0e2a\u0e04\u0e23\u0e34\u0e1b\u0e15\u0e4c\u0e40\u0e1b\u0e25\u0e35\u0e48\u0e22\u0e19 Category \u0e43\u0e2b\u0e49\u0e44\u0e21\u0e48\u0e44\u0e14\u0e49 \u0e40\u0e1e\u0e23\u0e32\u0e30\u0e15\u0e49\u0e2d\u0e07\u0e23\u0e39\u0e49\u0e27\u0e48\u0e32\u0e27\u0e31\u0e15\u0e16\u0e38\u0e04\u0e37\u0e2d\u0e2d\u0e30\u0e44\u0e23)',
     'In-Place Families': u'\u0e41\u0e01\u0e49\u0e40\u0e2d\u0e07: \u0e16\u0e49\u0e32\u0e43\u0e0a\u0e49\u0e2b\u0e25\u0e32\u0e22\u0e15\u0e33\u0e41\u0e2b\u0e19\u0e48\u0e07 \u0e43\u0e2b\u0e49\u0e2a\u0e23\u0e49\u0e32\u0e07\u0e40\u0e1b\u0e47\u0e19 Loadable Family (.rfa) \u0e41\u0e25\u0e49\u0e27\u0e42\u0e2b\u0e25\u0e14\u0e41\u0e17\u0e19\u0e02\u0e2d\u0e07\u0e40\u0e14\u0e34\u0e21 \u0e16\u0e49\u0e32\u0e40\u0e1b\u0e47\u0e19\u0e07\u0e32\u0e19\u0e1e\u0e34\u0e40\u0e28\u0e29\u0e0a\u0e34\u0e49\u0e19\u0e40\u0e14\u0e35\u0e22\u0e27\u0e04\u0e07\u0e44\u0e27\u0e49\u0e44\u0e14\u0e49 \u0e41\u0e15\u0e48\u0e43\u0e2b\u0e49\u0e19\u0e49\u0e2d\u0e22\u0e17\u0e35\u0e48\u0e2a\u0e38\u0e14',
     'Imported DWG file': u'\u0e41\u0e19\u0e30\u0e19\u0e33: \u0e25\u0e1a DWG \u0e17\u0e35\u0e48 Import \u0e17\u0e34\u0e49\u0e07 (\u0e1b\u0e38\u0e48\u0e21 Fix) \u0e41\u0e25\u0e49\u0e27 Purge Unused \u0e2d\u0e35\u0e01\u0e04\u0e23\u0e31\u0e49\u0e07 \u0e2b\u0e32\u0e01\u0e08\u0e33\u0e40\u0e1b\u0e47\u0e19\u0e15\u0e49\u0e2d\u0e07\u0e43\u0e0a\u0e49\u0e40\u0e1b\u0e47\u0e19 Reference \u0e43\u0e2b\u0e49\u0e43\u0e0a\u0e49 Link CAD \u0e41\u0e17\u0e19 Import CAD',
     'Link Model Workset': u'Workset ของ Link ตั้งชื่อรูปแบบ *LINKED MODEL_<ชื่อไฟล์ Link> เช่น *LINKED MODEL_CHB-SDT-PNS ปุ่ม Fix จะย้าย Link เข้า Workset ชื่อนี้ (ถ้ายังไม่มีจะสร้างให้) ตอน Link ไฟล์ใหม่ให้เลือก Place on: เป็น Workset นี้ตั้งแต่แรก',
     'Elements in Link Workset': u'\u0e27\u0e31\u0e15\u0e16\u0e38\u0e02\u0e2d\u0e07\u0e40\u0e23\u0e32\u0e44\u0e21\u0e48\u0e04\u0e27\u0e23\u0e2d\u0e22\u0e39\u0e48\u0e1a\u0e19 Workset \u0e02\u0e2d\u0e07 Link \u0e43\u0e0a\u0e49\u0e1b\u0e38\u0e48\u0e21 Move \u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e22\u0e49\u0e32\u0e22\u0e44\u0e1b Workset \u0e17\u0e35\u0e48\u0e16\u0e39\u0e01\u0e15\u0e49\u0e2d\u0e07 \u0e16\u0e49\u0e32\u0e40\u0e1b\u0e47\u0e19\u0e27\u0e31\u0e15\u0e16\u0e38\u0e08\u0e32\u0e01\u0e44\u0e1f\u0e25\u0e4c Link \u0e08\u0e23\u0e34\u0e07 \u0e46 \u0e2d\u0e32\u0e08\u0e40\u0e01\u0e34\u0e14\u0e08\u0e32\u0e01\u0e01\u0e32\u0e23 Bind Link',
-    'Unhosted Family': u'Family ที่ Host หายไป (Orphaned): ห้ามลบ เครื่องมือนี้ยังไม่แก้ให้ ใช้ Select in Revit เพื่อดูแล้วตรวจสอบเอง',
+    'Unhosted Family': u'Family ที่ Host หายไป (Orphaned): ห้ามลบ ปุ่ม Fix จะย้ายไป Workset ZZ_UNHOSTED_REVIEW เพื่อแยกตรวจเท่านั้น ไม่ลบอะไรทั้งสิ้น',
 }
+
+
+EXTRA_HEADING = 'EXTRA - NOT IN THE CHECK SET (not counted in the score)'
+
+
+def chk_prefix_category(ctx, chk):
+    """Families that have a g-XXX prefix, but not the one their category should have."""
+    table = load_prefix_table()
+    items = []
+    for fam in DB.FilteredElementCollector(doc).OfClass(clr_type(DB.Family)).ToElements():
+        try:
+            cat = fam.FamilyCategory.Name
+            expected = table.get(_norm_cat(cat))
+            if expected is None:
+                continue
+            m = re.match(r'^(g-[A-Z]{3})(?=[-_ ]|$)', fam.Name)
+            if m is None:                 # no prefix at all: the "Family Naming Convention" check covers that
+                continue
+            if m.group(1) != expected:
+                items.append((fam.Name, fam.Id, 'Category: %s | expected %s | found %s' % (cat, expected, m.group(1))))
+        except Exception:
+            continue
+    items.sort(key=lambda x: x[0])
+    if items:
+        return Result('FAIL', '%d family(ies) use the prefix of a different category' % len(items), items)
+    return Result('PASS', 'Every family prefix matches its category')
+
+
+CHECK_FUNCS['PrefixMatchesCategory'] = chk_prefix_category
+
+
+def make_extra_checks():
+    d = CheckDef()
+    d.heading = EXTRA_HEADING
+    d.section = 'Family'
+    d.name = 'Family Prefix matches Category'
+    d.type = 'PrefixMatchesCategory'
+    d.required = False
+    d.description = 'Extra check: the g-XXX prefix must be the one the naming sheet assigns to the family\'s category (e.g. a door must be g-DOR).'
+    d.extra = True
+    return [d]
 
 
 def fixers_for(chk):
@@ -1495,6 +1988,8 @@ def score_kind(chk):
 def tally_checks(results, checks):
     t = {'pass': 0, 'fail': 0, 'cl': 0, 'notrun': 0, 'error': 0}
     for chk in checks:
+        if getattr(chk, 'extra', False):
+            continue
         res = results.get(id(chk))
         if res is None or res.status == 'SKIP':
             t['notrun'] += 1
@@ -1525,6 +2020,9 @@ LAST_XML_FILE = os.path.join(os.environ.get('APPDATA', ''), 'pyRevit', 'NRK_Mode
 
 
 def default_xml():
+    saved = SETTINGS.get('xml_path')
+    if saved and os.path.exists(saved):
+        return saved
     here = os.path.dirname(os.path.abspath(__file__))
     for f in sorted(os.listdir(here)):
         if f.lower().endswith('.xml'):
@@ -1552,6 +2050,90 @@ class RevitWindow(WF.IWin32Window):
     @property
     def Handle(self):
         return self._handle
+
+
+def show_score_history(model):
+    """Modal dialog: score over time for this model (line chart + list)."""
+    rows = read_history(model)
+    f = WF.Form()
+    f.Text = 'Score history - %s' % (model or '')
+    f.Width = 780
+    f.Height = 580
+    f.StartPosition = WF.FormStartPosition.CenterParent
+    chart = WF.Panel()
+    chart.Dock = WF.DockStyle.Top
+    chart.Height = 230
+    chart.BackColor = SD.Color.White
+
+    def paint(s_, e_):
+        try:
+            g = e_.Graphics
+            w = float(chart.ClientSize.Width)
+            h = float(chart.ClientSize.Height)
+            left, right, top, bottom = 46.0, 18.0, 16.0, 26.0
+            pw = w - left - right
+            ph = h - top - bottom
+            grid = SD.Pen(SD.Color.LightGray)
+            font = SD.Font('Segoe UI', 8.0)
+            for v in (0, 25, 50, 75, 100):
+                y = top + ph - ph * v / 100.0
+                g.DrawLine(grid, left, y, left + pw, y)
+                g.DrawString('%d%%' % v, font, SD.Brushes.Gray, 6.0, y - 7.0)
+            if not rows:
+                g.DrawString('No history yet - run all checks to record a score.', font, SD.Brushes.Gray, left + 10.0, top + 10.0)
+                return
+            n = len(rows)
+            pts = []
+            for k, r in enumerate(rows):
+                x = left + (pw * k / float(n - 1) if n > 1 else pw / 2.0)
+                y = top + ph - ph * r[1] / 100.0
+                pts.append((float(x), float(y)))
+            pen = SD.Pen(SD.Color.FromArgb(40, 120, 200), 2.0)
+            for a, b in zip(pts, pts[1:]):
+                g.DrawLine(pen, a[0], a[1], b[0], b[1])
+            for (x, y), r in zip(pts, rows):
+                g.FillEllipse(SD.Brushes.SteelBlue, x - 3.0, y - 3.0, 6.0, 6.0)
+            x, y = pts[-1]
+            g.DrawString('%d%%' % rows[-1][1], SD.Font('Segoe UI', 9.0, SD.FontStyle.Bold), SD.Brushes.Black, x - 14.0, y - 22.0)
+        except Exception:
+            pass
+    chart.Paint += paint
+
+    lv = WF.ListView()
+    lv.Dock = WF.DockStyle.Fill
+    lv.View = WF.View.Details
+    lv.FullRowSelect = True
+    lv.GridLines = True
+    for name, width in (('Date', 150), ('Score', 70), ('Change', 70), ('Pass', 60), ('Fail', 60), ('Count/List', 80), ('Not Run', 70)):
+        lv.Columns.Add(name, width)
+    prev = None
+    ordered = []
+    for r in rows:
+        ordered.append((r, None if prev is None else r[1] - prev))
+        prev = r[1]
+    for r, delta in reversed(ordered):                       # newest first
+        it = WF.ListViewItem(r[0])
+        it.SubItems.Add('%d%%' % r[1])
+        it.SubItems.Add('' if delta is None else ('%+d' % delta))
+        it.SubItems.Add(str(r[2]))
+        it.SubItems.Add(str(r[3]))
+        it.SubItems.Add(str(r[4]))
+        it.SubItems.Add(str(r[5]))
+        lv.Items.Add(it)
+    bar = WF.Panel()
+    bar.Dock = WF.DockStyle.Bottom
+    bar.Height = 40
+    b = WF.Button()
+    b.Text = 'Close'
+    b.Left = 8
+    b.Top = 7
+    b.DialogResult = WF.DialogResult.OK
+    bar.Controls.Add(b)
+    f.Controls.Add(lv)
+    f.Controls.Add(chart)
+    f.Controls.Add(bar)
+    f.AcceptButton = b
+    f.ShowDialog()
 
 
 class _Handler(UI.IExternalEventHandler):
@@ -1603,6 +2185,7 @@ class HealthForm(WF.Form):
         self.model_title = None
         self.fail_notes = {}            # eid -> why the last fix could not change it
         self.groups = {}                # heading -> ListViewGroup (header shows that group's score)
+        self._last_logged = None        # last score written to the history file
         self._run_i = 0                 # progress: checks finished so far
         self._run_n = 0                 # progress: checks in this run
 
@@ -1611,6 +2194,16 @@ class HealthForm(WF.Form):
         self.Height = 800
         self.MinimumSize = SD.Size(980, 560)
         self.StartPosition = WF.FormStartPosition.CenterScreen
+        try:
+            w = SETTINGS.get('win')
+            if w and len(w) == 4:
+                rect = SD.Rectangle(int(w[0]), int(w[1]), int(w[2]), int(w[3]))
+                if any(sc.WorkingArea.IntersectsWith(rect) for sc in WF.Screen.AllScreens):   # still on a screen
+                    self.StartPosition = WF.FormStartPosition.Manual
+                    self.Location = SD.Point(rect.X, rect.Y)
+                    self.Size = SD.Size(rect.Width, rect.Height)
+        except Exception:
+            pass
         self.Font = SD.Font('Segoe UI', 9.0)
         self.KeyPreview = True
         self.KeyDown += self.on_key
@@ -1720,16 +2313,24 @@ class HealthForm(WF.Form):
         self.txt_search = WF.TextBox()
         self.txt_search.Left = 56
         self.txt_search.Top = 5
-        self.txt_search.Width = 230
+        self.txt_search.Width = 190
         self.txt_search.TextChanged += lambda s, e: self.refresh_list()
         lbar.Controls.Add(self.txt_search)
         self.chk_issues = WF.CheckBox()
         self.chk_issues.Text = 'Issues only'
-        self.chk_issues.Left = 300
+        self.chk_issues.Left = 256
         self.chk_issues.Top = 6
         self.chk_issues.AutoSize = True
         self.chk_issues.CheckedChanged += lambda s, e: self.refresh_list()
         lbar.Controls.Add(self.chk_issues)
+        self.chk_sys = WF.CheckBox()
+        self.chk_sys.Text = 'Skip system families'
+        self.chk_sys.Left = 350
+        self.chk_sys.Top = 6
+        self.chk_sys.AutoSize = True
+        self.chk_sys.Checked = True
+        self.chk_sys.CheckedChanged += self.on_sys_changed
+        lbar.Controls.Add(self.chk_sys)
 
         lbtm = WF.Panel()
         lbtm.Dock = WF.DockStyle.Bottom
@@ -1738,6 +2339,7 @@ class HealthForm(WF.Form):
         self.btn_run_all = self.make_button(lbtm, 'Run all ticked', 140, 6, self.on_run_ticked, 110)
         self.make_button(lbtm, 'Tick all', 258, 6, lambda s, e: self.tick_all(True), 65)
         self.make_button(lbtm, 'Tick none', 328, 6, lambda s, e: self.tick_all(False), 75)
+        self.make_button(lbtm, 'XML defaults', 408, 6, self.on_xml_defaults, 95)
 
         self.lv = WF.ListView()
         self.lv.Dock = WF.DockStyle.Fill
@@ -1778,7 +2380,7 @@ class HealthForm(WF.Form):
 
         rbtm = WF.Panel()
         rbtm.Dock = WF.DockStyle.Bottom
-        rbtm.Height = 40
+        rbtm.Height = 74
         self.make_button(rbtm, 'Select in Revit', 4, 6, self.on_select_clicked, 105)
         self.make_button(rbtm, 'Zoom to', 114, 6, self.on_zoom_clicked, 75)
         self.chk_auto = WF.CheckBox()
@@ -1788,8 +2390,17 @@ class HealthForm(WF.Form):
         self.chk_auto.AutoSize = True
         self.chk_auto.Checked = True
         rbtm.Controls.Add(self.chk_auto)
-        b = self.make_button(rbtm, 'Export CSV', 400, 6, self.on_export, 90)
-        b.Anchor = WF.AnchorStyles.Top | WF.AnchorStyles.Right
+        self.chk_group = WF.CheckBox()
+        self.chk_group.Text = 'Group by family'
+        self.chk_group.Left = 420
+        self.chk_group.Top = 11
+        self.chk_group.AutoSize = True
+        self.chk_group.Checked = True
+        self.chk_group.CheckedChanged += lambda s_, e_: self.show_details()
+        rbtm.Controls.Add(self.chk_group)
+        self.make_button(rbtm, 'Export CSV', 4, 40, self.on_export, 90)
+        self.make_button(rbtm, 'Score history', 100, 40, self.on_history, 100)
+        self.make_button(rbtm, 'Fix log', 206, 40, self.on_open_log, 80)
 
         self.dv = WF.ListView()
         self.dv.Dock = WF.DockStyle.Fill
@@ -1811,6 +2422,11 @@ class HealthForm(WF.Form):
         self.fix_panel.AutoSizeMode = WF.AutoSizeMode.GrowAndShrink
         self.fix_panel.Padding = WF.Padding(0, 4, 0, 4)
         self.fix_panel.Visible = False
+        self.chk_delete = WF.CheckBox()
+        self.chk_delete.Text = 'Allow delete fixes'
+        self.chk_delete.AutoSize = True
+        self.chk_delete.Checked = False
+        self.chk_delete.CheckedChanged += self.on_delete_toggled
 
         self.split.Panel2.Controls.Add(self.dv)
         self.split.Panel2.Controls.Add(self.fix_panel)
@@ -1883,11 +2499,45 @@ class HealthForm(WF.Form):
         self.lbl_model.Text = title
 
     def on_shown(self, s, e):
+        try:
+            self.chk_issues.Checked = bool(SETTINGS.get('issues_only', False))
+            self.chk_auto.Checked = bool(SETTINGS.get('auto_select', True))
+            self.chk_sys.Checked = bool(SETTINGS.get('skip_system_families', True))
+            self.chk_group.Checked = bool(SETTINGS.get('group_by_family', True))
+            self.chk_delete.Checked = bool(SETTINGS.get('allow_delete', False))
+            if SETTINGS.get('splitter'):
+                self.split.SplitterDistance = int(SETTINGS['splitter'])
+            if SETTINGS.get('maximized'):
+                self.WindowState = WF.FormWindowState.Maximized
+        except Exception:
+            pass
         self.txt_xml.Text = default_xml()
         self.load_checks()
         self.post(self.sync_model)
 
+    def persist(self):
+        """Write the current settings to disk (window, ticks, toggles, last XML)."""
+        try:
+            d = SETTINGS
+            d['xml_path'] = self.txt_xml.Text.strip()
+            if self.checks:
+                d['ticked'] = dict(('%s|%s' % (c.heading, c.name), bool(c.checked)) for c in self.checks)
+            d['issues_only'] = bool(self.chk_issues.Checked)
+            d['auto_select'] = bool(self.chk_auto.Checked)
+            d['skip_system_families'] = bool(self.chk_sys.Checked)
+            d['group_by_family'] = bool(self.chk_group.Checked)
+            d['allow_delete'] = bool(self.chk_delete.Checked)
+            normal = (self.WindowState == WF.FormWindowState.Normal)
+            b = self.Bounds if normal else self.RestoreBounds
+            d['win'] = [b.X, b.Y, b.Width, b.Height]
+            d['maximized'] = (self.WindowState == WF.FormWindowState.Maximized)
+            d['splitter'] = int(self.split.SplitterDistance)
+            save_settings(d)
+        except Exception:
+            pass
+
     def on_closed(self, s, e):
+        self.persist()
         self.cancel = True
         try:
             self._appdomain.CurrentDomain.SetData(self._appdomain_key, None)
@@ -1922,13 +2572,20 @@ class HealthForm(WF.Form):
         except Exception as ex:
             self.msg.Text = 'Could not read XML: %s' % ex
             return
+        self.checks = self.checks + make_extra_checks()
         try:
             open(LAST_XML_FILE, 'w').write(path)
         except Exception:
             pass
+        ticked = SETTINGS.get('ticked') or {}
+        for chk in self.checks:
+            k = '%s|%s' % (chk.heading, chk.name)
+            if k in ticked:
+                chk.checked = bool(ticked[k])
         self.Text = 'Model Health Check  -  %s' % name
         self.refresh_list()
-        self.lbl_sum.Text = '%d checks loaded' % len(self.checks)
+        self.persist()
+        self.lbl_sum.Text = '%d checks loaded (your last tick settings applied)' % len(self.checks)
         self.msg.Text = ('Double-click a check (or press F5) to run just that one. '
                          'Use "Run all ticked" before you submit the model.')
 
@@ -1973,6 +2630,8 @@ class HealthForm(WF.Form):
         self.update_scores()
 
     def group_header(self, heading):
+        if heading == EXTRA_HEADING:
+            return heading
         t = tally_checks(self.results, [c for c in self.checks if c.heading == heading])
         p = score_pct(t)
         return '%s     %s%s' % (heading, ('%d%%   -   ' % p) if p is not None else '', tally_text(t))
@@ -1984,20 +2643,29 @@ class HealthForm(WF.Form):
         if p is None:
             self.lbl_score.Text = '--'
             self.lbl_score.ForeColor = SD.Color.Gray
-            self.lbl_score_sum.Text = '%d checks  |  %s' % (len(self.checks), tally_text(t))
+            self.lbl_score_sum.Text = '%d checks  |  %s' % (len([c for c in self.checks if not c.extra]), tally_text(t))
         else:
             self.lbl_score.Text = '%d%%' % p
             self.lbl_score.ForeColor = (SD.Color.FromArgb(200, 40, 40) if p < 50 else
                                         SD.Color.FromArgb(220, 130, 0) if p < 80 else
                                         SD.Color.FromArgb(40, 150, 60))
             self.lbl_score_sum.Text = '%d checks  |  %d Pass (%d%%)  |  %d Fail  |  %d Count/List  |  %d Not Run%s' % (
-                len(self.checks), t['pass'], p, t['fail'], t['cl'], t['notrun'],
+                len([c for c in self.checks if not c.extra]), t['pass'], p, t['fail'], t['cl'], t['notrun'],
                 ('  |  %d Error' % t['error']) if t['error'] else '')
         for h, g in self.groups.items():
             try:
                 g.Header = self.group_header(h)
             except Exception:
                 pass
+
+    def on_sys_changed(self, s, e):
+        SETTINGS['skip_system_families'] = bool(self.chk_sys.Checked)
+        self.lbl_sum.Text = 'Option changed - run "Family Naming Convention" again to apply it'
+
+    def on_xml_defaults(self, s, e):
+        for chk in self.checks:
+            chk.checked = chk.xml_checked
+        self.refresh_list()
 
     def on_item_checked(self, s, e):
         if not self.building and e.Item.Tag is not None:
@@ -2088,6 +2756,9 @@ class HealthForm(WF.Form):
         self._run_n = 0
         self.set_busy(False)
         self.update_scores()
+        self.persist()
+        if not self.cancel:
+            self.log_history()
         self.update_summary(time.time() - t0)
         if self.chk_issues.Checked:
             self.refresh_list()
@@ -2119,33 +2790,99 @@ class HealthForm(WF.Form):
             return
         self.msg.Text = u'%s: %s\r\n%s%s' % (res.status, res.message, head, tail)
         self.dv.BeginUpdate()
-        for text, eid, extra in res.items[:MAX_ROWS]:
-            li = WF.ListViewItem(text)
-            li.SubItems.Add(str(eid_val(eid)) if eid is not None else '')
-            note = self.fail_notes.get(eid_val(eid)) if eid is not None else None
-            if note:
-                li.SubItems.Add('FIX FAILED: ' + note)
-                li.BackColor = STATUS_COLORS['FAIL']
-            else:
-                li.SubItems.Add(extra or '')
-            li.Tag = eid
-            self.dv.Items.Add(li)
-        if len(res.items) > MAX_ROWS:
-            self.dv.Items.Add(WF.ListViewItem('... %d more (see CSV export)' % (len(res.items) - MAX_ROWS)))
+        if res.groups and self.chk_group.Checked:
+            # one row per family, with the number of instances
+            for label, ids, extra in res.groups[:MAX_ROWS]:
+                li = WF.ListViewItem('%s     (%d instance(s))' % (label, len(ids)))
+                li.SubItems.Add(str(eid_val(ids[0])) + ('...' if len(ids) > 1 else ''))
+                note = None
+                for i_ in ids:
+                    note = self.fail_notes.get(eid_val(i_))
+                    if note:
+                        break
+                if note:
+                    li.SubItems.Add('FIX FAILED: ' + note)
+                    li.BackColor = STATUS_COLORS['FAIL']
+                else:
+                    li.SubItems.Add(extra or '')
+                li.Tag = list(ids)
+                self.dv.Items.Add(li)
+        else:
+            for text, eid, extra in res.items[:MAX_ROWS]:
+                li = WF.ListViewItem(text)
+                li.SubItems.Add(str(eid_val(eid)) if eid is not None else '')
+                note = self.fail_notes.get(eid_val(eid)) if eid is not None else None
+                if note:
+                    li.SubItems.Add('FIX FAILED: ' + note)
+                    li.BackColor = STATUS_COLORS['FAIL']
+                else:
+                    li.SubItems.Add(extra or '')
+                li.Tag = eid
+                self.dv.Items.Add(li)
+            if len(res.items) > MAX_ROWS:
+                self.dv.Items.Add(WF.ListViewItem('... %d more (see CSV export)' % (len(res.items) - MAX_ROWS)))
         self.dv.EndUpdate()
         if res.items:
-            for fx in fixers_for(chk):
+            fixers = fixers_for(chk)
+            if any(fx.destructive for fx in fixers):
+                self.fix_panel.Controls.Add(self.chk_delete)
+            allowed = SETTINGS.get('allow_delete', False)
+            for fx in fixers:
                 b = WF.Button()
-                b.Text = 'Fix: ' + fx.label
+                locked = fx.destructive and not allowed
+                b.Text = 'Fix: ' + fx.label + ('   [locked]' if locked else '')
                 b.AutoSize = True
+                b.Enabled = not locked
                 b.Click += (lambda s_, e_, fx_=fx: self.on_fix(chk, fx_))
                 self.fix_panel.Controls.Add(b)
             self.fix_panel.Visible = self.fix_panel.Controls.Count > 0
 
+    def log_history(self):
+        """Record the score when every ticked check has a result (a complete picture)."""
+        try:
+            main = [c for c in self.checks if not c.extra]
+            if not main or any(c.checked and id(c) not in self.results for c in main):
+                return
+            t = tally_checks(self.results, self.checks)
+            p = score_pct(t)
+            if p is None:
+                return
+            sig = (self.model_title, p, t['pass'], t['fail'], t['cl'], t['notrun'])
+            if sig == self._last_logged:
+                return
+            self._last_logged = sig
+            append_history(self.model_title, t, p)
+        except Exception:
+            pass
+
+    def on_history(self, s, e):
+        show_score_history(self.model_title)
+
+    def on_open_log(self, s, e):
+        try:
+            path = os.path.join(data_dir(), 'FixLog_%s.csv' % file_safe(self.model_title))
+            os.startfile(path if os.path.exists(path) else data_dir())
+        except Exception as ex:
+            WF.MessageBox.Show('Could not open the log: %s' % ex, 'Model Health Check')
+
+    def on_delete_toggled(self, s, e):
+        SETTINGS['allow_delete'] = bool(self.chk_delete.Checked)
+        self.persist()
+        self.show_details()
+
     def picked_ids(self, selected_only=True):
-        ids = [li.Tag for li in self.dv.SelectedItems if li.Tag is not None]
+        def flat(tag):
+            if tag is None:
+                return []
+            if isinstance(tag, (list, tuple)):
+                return list(tag)
+            return [tag]
+        ids = []
+        for li in self.dv.SelectedItems:
+            ids.extend(flat(li.Tag))
         if not ids and not selected_only:
-            ids = [li.Tag for li in self.dv.Items if li.Tag is not None]
+            for li in self.dv.Items:
+                ids.extend(flat(li.Tag))
         return ids
 
     def on_item_selected(self, s, e):
@@ -2195,7 +2932,7 @@ class HealthForm(WF.Form):
         res = self.results.get(id(chk))
         if res is None:
             return
-        ids = [li.Tag for li in self.dv.SelectedItems if li.Tag is not None]
+        ids = self.picked_ids(True)
         if not ids:
             ids = [i for _, i, _ in res.items if i is not None]
         if not ids:
@@ -2207,6 +2944,9 @@ class HealthForm(WF.Form):
         """Runs inside a job (valid Revit API context)."""
         try:
             self.sync_model()
+            if fixer.destructive and not SETTINGS.get('allow_delete', False):
+                WF.MessageBox.Show('Delete fixes are locked. Tick "Allow delete fixes" first.', 'Model Health Check')
+                return
             live = [i for i in ids if doc is not None and doc.GetElement(i) is not None]
             if not live:
                 WF.MessageBox.Show('Nothing to fix - the elements no longer exist.', 'Model Health Check')
@@ -2244,6 +2984,8 @@ class HealthForm(WF.Form):
                                       WF.MessageBoxButtons.OKCancel,
                                       WF.MessageBoxIcon.Warning) != WF.DialogResult.OK:
                     return
+            FIX_EXTRA_NOTES.clear()
+            FIX_CHANGES[:] = []
             pre = FailLog()
             t = DB.Transaction(doc, 'Model Health Check: ' + fixer.label)
             t.Start()
@@ -2282,8 +3024,13 @@ class HealthForm(WF.Form):
                 for e_, d_, r_ in failures:
                     if e_ is not None:
                         self.fail_notes[eid_val(e_)] = r_
+                for k_, v_ in FIX_EXTRA_NOTES.items():
+                    self.fail_notes[k_] = v_
                 if pre.messages:
                     summary += '\r\nRevit warnings: ' + '; '.join(pre.messages[:3])
+                logfile = write_fix_log(self.model_title, chk.name, fixer.label, summary, list(FIX_CHANGES), failures)
+                if logfile:
+                    summary += '\r\nLogged to: ' + logfile
                 show_fix_report('Model Health Check - fix report', summary, failures)
         finally:
             self.set_busy(False)
@@ -2298,10 +3045,13 @@ class HealthForm(WF.Form):
             return
         dlg = WF.SaveFileDialog()
         dlg.Filter = 'CSV (*.csv)|*.csv'
+        if SETTINGS.get('export_dir') and os.path.isdir(SETTINGS['export_dir']):
+            dlg.InitialDirectory = SETTINGS['export_dir']
         title = os.path.splitext(self.model_title or 'model')[0]
         dlg.FileName = 'ModelHealthCheck_%s_%s.csv' % (re.sub(r'[^\w\-]+', '_', title), time.strftime('%Y%m%d_%H%M'))
         if dlg.ShowDialog() != WF.DialogResult.OK:
             return
+        SETTINGS['export_dir'] = os.path.dirname(dlg.FileName)
         lines = [','.join(csv_cell(h) for h in
                           ('Priority', 'Section', 'Check', 'Status', 'Message', 'Item', 'ElementId', 'Info'))]
         for chk in self.checks:
@@ -2335,6 +3085,7 @@ _guard_class(_Handler)
 _guard_class(FailLog)
 
 def main():
+    SETTINGS.update(load_settings())
     existing = System.AppDomain.CurrentDomain.GetData(APPDOMAIN_KEY)
     try:
         if existing is not None and not existing.IsDisposed:
