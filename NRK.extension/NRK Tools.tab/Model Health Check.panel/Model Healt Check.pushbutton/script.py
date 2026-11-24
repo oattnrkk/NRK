@@ -2499,6 +2499,7 @@ class HealthForm(WF.Form):
         self.lbl_model.Text = title
 
     def on_shown(self, s, e):
+        self.txt_xml.Text = default_xml()
         try:
             self.chk_issues.Checked = bool(SETTINGS.get('issues_only', False))
             self.chk_auto.Checked = bool(SETTINGS.get('auto_select', True))
@@ -2519,7 +2520,8 @@ class HealthForm(WF.Form):
         """Write the current settings to disk (window, ticks, toggles, last XML)."""
         try:
             d = SETTINGS
-            d['xml_path'] = self.txt_xml.Text.strip()
+            if self.txt_xml.Text.strip():
+                d['xml_path'] = self.txt_xml.Text.strip()
             if self.checks:
                 d['ticked'] = dict(('%s|%s' % (c.heading, c.name), bool(c.checked)) for c in self.checks)
             d['issues_only'] = bool(self.chk_issues.Checked)
