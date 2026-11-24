@@ -1510,22 +1510,24 @@ def choose_workset(prompt, exclude):
     return None
 
 
+def ws_owner_note(ws):
+    """Extra hint for a failed move - only when ANOTHER user really owns the target workset."""
+    try:
+        owner = ws.Owner
+        if owner and owner != app.Username:
+            return ' (target workset "%s" is owned by %s)' % (ws.Name, owner)
+    except Exception:
+        pass
+    return ''
+
+
 def fx_move_workset(ids, ws):
+    """No pre-check on the target workset: 'Editable: No' only means nobody has it checked out,
+    and Revit still lets you move elements into it. We try the move and report what Revit says."""
     failures = []
     done = 0
-    if not ws.IsEditable:
-        owner = ''
-        try:
-            owner = ws.Owner
-        except Exception:
-            pass
-        reason = 'Target workset "%s" is checked out by %s' % (ws.Name, owner or 'someone else')
-        for i in ids:
-            el = doc.GetElement(i)
-            if el is not None:
-                add_fail(failures, el, reason)
-        return '0 element(s) moved, %d skipped' % len(failures), failures
     blocked = blockers(ids, check_pinned=False, check_group=True)
+    note = None
     for i in ids:
         el = doc.GetElement(i)
         if el is None:
@@ -1533,7 +1535,9 @@ def fx_move_workset(ids, ws):
         old = ws_name_of(el)
         r = blocked.get(eid_val(i)) or set_workset(el, ws)
         if r:
-            add_fail(failures, el, r)
+            if note is None:
+                note = ws_owner_note(ws)
+            add_fail(failures, el, r + note)
         else:
             done += 1
             FIX_CHANGES.append(('moved workset', i, short_desc(el), '"%s" -> "%s"' % (old, ws.Name)))
